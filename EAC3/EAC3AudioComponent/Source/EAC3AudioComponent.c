@@ -13,7 +13,7 @@
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 // Define DEBUG_LOGGING to enable debug output
-// #define DEBUG_LOGGING 1
+#define DEBUG_LOGGING 1
 
 #ifdef DEBUG_LOGGING
 // Debug logging
@@ -63,6 +63,7 @@ typedef struct EAC3Decoder {
     Boolean isInitialized;
     UInt32 packetFrameSize;
     UInt32 maxPacketSize;
+    Boolean needsReset;
 } EAC3Decoder;
 
 // AudioComponent plugin instance structure
@@ -584,6 +585,9 @@ static OSStatus Initialize(void *self,
         return kAudioCodecStateError;
     }
     
+    // Configure parser flags
+    decoder->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+    
     // Allocate frame and packet
     decoder->frame = av_frame_alloc();
     if (!decoder->frame) {
@@ -706,6 +710,13 @@ static OSStatus AppendInputData(void *self,
         
         memcpy(decoder->inputBuffer + decoder->inputBufferUsed, inInputData, *ioInputDataByteSize);
         decoder->inputBufferUsed += *ioInputDataByteSize;
+        
+        // Log first few bytes to check format
+        if (decoder->inputBufferUsed >= 4) {
+            DebugLog("AppendInputData: First 4 bytes: %02x %02x %02x %02x", 
+                     decoder->inputBuffer[0], decoder->inputBuffer[1], 
+                     decoder->inputBuffer[2], decoder->inputBuffer[3]);
+        }
     }
     
     return noErr;
@@ -729,36 +740,26 @@ static OSStatus ProduceOutputData(void *self,
     }
     
     // Decode frames if we need more
-    UInt32 requestedFrames = *ioNumberPackets;  // In PCM, packets = frames
+    // Calculate requested frames from byte size
+    UInt32 requestedFrames = *ioOutputDataByteSize / decoder->outputFormat.mBytesPerFrame;
     
-    DebugLog("ProduceOutputData: Decoding... requestedFrames=%u, bufferedFrames=%u, inputBytes=%u", 
-             requestedFrames, decoder->outputBufferUsed, decoder->inputBufferUsed);
+    DebugLog("ProduceOutputData: Decoding... requestedPackets=%u, requestedBytes=%u (frames=%u), bufferedFrames=%u, inputBytes=%u", 
+             *ioNumberPackets, *ioOutputDataByteSize, requestedFrames, decoder->outputBufferUsed, decoder->inputBufferUsed);
     
-    while (decoder->outputBufferUsed < requestedFrames && decoder->inputBufferUsed > 0) {
-        int ret = av_parser_parse2(decoder->parser, decoder->codecContext,
-                                  &decoder->packet->data, &decoder->packet->size,
-                                  decoder->inputBuffer, decoder->inputBufferUsed,
-                                  AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+    // If we have input data, try to decode it directly as a complete frame
+    if (decoder->inputBufferUsed > 0 && decoder->outputBufferUsed < requestedFrames) {
+        // Set packet data directly from input buffer
+        decoder->packet->data = decoder->inputBuffer;
+        decoder->packet->size = decoder->inputBufferUsed;
         
-        if (ret < 0) {
-            DebugLog("ProduceOutputData: Parser error");
-            break;
-        }
-        
-        // Move consumed data
-        if (ret > 0) {
-            memmove(decoder->inputBuffer, decoder->inputBuffer + ret,
-                   decoder->inputBufferUsed - ret);
-            decoder->inputBufferUsed -= ret;
-        }
+        DebugLog("ProduceOutputData: Attempting to decode %d bytes directly", decoder->packet->size);
         
         if (decoder->packet->size > 0) {
             // Send packet to decoder
-            ret = avcodec_send_packet(decoder->codecContext, decoder->packet);
-            if (ret < 0) {
+            int ret = avcodec_send_packet(decoder->codecContext, decoder->packet);
+            if (ret < 0 && ret != AVERROR_INVALIDDATA) {
                 DebugLog("ProduceOutputData: Error sending packet, ret=%d", ret);
-                continue;
-            }
+            } else {
             
             // Receive frames
             while (ret >= 0) {
@@ -769,6 +770,8 @@ static OSStatus ProduceOutputData(void *self,
                     DebugLog("ProduceOutputData: Error receiving frame, ret=%d", ret);
                     break;
                 }
+                
+                DebugLog("ProduceOutputData: Decoded frame with %d samples", decoder->frame->nb_samples);
                 
                 // Update output format info from decoder if needed
                 if (decoder->codecContext->channels != decoder->outputFormat.mChannelsPerFrame ||
@@ -842,11 +845,12 @@ static OSStatus ProduceOutputData(void *self,
                 decoder->outputBufferUsed += samples;
                 decoder->packetFrameSize = samples;
             }
-        }
-        
-        // Break if we didn't consume any input
-        if (ret == 0 && decoder->packet->size == 0) {
-            break;
+            }
+            
+            // Clear input buffer after successful decode
+            if (decoder->outputBufferUsed > 0) {
+                decoder->inputBufferUsed = 0;
+            }
         }
     }
     
@@ -855,8 +859,9 @@ static OSStatus ProduceOutputData(void *self,
     
     // Copy output
     UInt32 framesToCopy = decoder->outputBufferUsed;
-    if (framesToCopy > *ioNumberPackets) {
-        framesToCopy = *ioNumberPackets;
+    UInt32 maxFrames = *ioOutputDataByteSize / decoder->outputFormat.mBytesPerFrame;
+    if (framesToCopy > maxFrames) {
+        framesToCopy = maxFrames;
     }
     
     if (framesToCopy > 0) {
@@ -892,7 +897,13 @@ static OSStatus ProduceOutputData(void *self,
         *ioOutputDataByteSize = 0;
     }
     
-    *ioNumberPackets = framesToCopy;
+    // For compressed formats, report packets (1 packet = 1536 frames for EAC3)
+    if (framesToCopy > 0) {
+        *ioNumberPackets = (framesToCopy + 1535) / 1536; // Round up
+    } else {
+        *ioNumberPackets = 0;
+    }
+    
     *outStatus = (decoder->inputBufferUsed == 0 && framesToCopy == 0) ?
                  kAudioCodecProduceOutputPacketAtEOF :
                  kAudioCodecProduceOutputPacketSuccess;
@@ -905,14 +916,45 @@ static OSStatus Reset(void *self) {
     
     DebugLog("Reset called: self=%p, decoder=%p", self, decoder);
     
-    // Clear buffers
+    if (!decoder->isInitialized) {
+        return noErr;
+    }
+    
+    // Clear buffers completely
     decoder->inputBufferUsed = 0;
     decoder->outputBufferUsed = 0;
+    if (decoder->inputBuffer) {
+        memset(decoder->inputBuffer, 0, decoder->inputBufferSize);
+    }
+    if (decoder->outputBuffer) {
+        memset(decoder->outputBuffer, 0, decoder->outputBufferFrames * 8 * sizeof(Float32));
+    }
     
     // Flush decoder
     if (decoder->codecContext) {
         avcodec_flush_buffers(decoder->codecContext);
     }
+    
+    // Reset parser - recreate it to ensure clean state
+    if (decoder->parser) {
+        av_parser_close(decoder->parser);
+        decoder->parser = av_parser_init(decoder->codec->id);
+        if (!decoder->parser) {
+            DebugLog("Reset: Failed to recreate parser");
+        }
+    }
+    
+    // Clear packet
+    if (decoder->packet) {
+        av_packet_unref(decoder->packet);
+    }
+    
+    // Clear frame
+    if (decoder->frame) {
+        av_frame_unref(decoder->frame);
+    }
+    
+    DebugLog("Reset complete");
     
     return noErr;
 }
