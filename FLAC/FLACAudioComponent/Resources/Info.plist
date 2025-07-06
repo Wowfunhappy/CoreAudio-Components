@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>FLACAudioComponent</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.flac.audio.decoder</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>FLAC Audio Decoder</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>AudioComponents</key>
+    <array>
+        <dict>
+            <key>type</key>
+            <string>adec</string>
+            <key>subtype</key>
+            <string>flac</string>
+            <key>manufacturer</key>
+            <string>Flac</string>
+            <key>name</key>
+            <string>FLAC Audio Decoder</string>
+            <key>description</key>
+            <string>FLAC audio decoder for QuickTime</string>
+            <key>version</key>
+            <integer>65536</integer>
+            <key>factoryFunction</key>
+            <string>FLACDecoderEntry</string>
+        </dict>
+        <dict>
+            <key>type</key>
+            <string>adec</string>
+            <key>subtype</key>
+            <string>fLaC</string>
+            <key>manufacturer</key>
+            <string>Flac</string>
+            <key>name</key>
+            <string>FLAC Audio Decoder (MP4)</string>
+            <key>description</key>
+            <string>FLAC audio decoder for MP4 containers</string>
+            <key>version</key>
+            <integer>65536</integer>
+            <key>factoryFunction</key>
+            <string>FLACDecoderEntry</string>
+        </dict>
+    </array>
+</dict>
+</plist>

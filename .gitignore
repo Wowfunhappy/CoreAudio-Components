@@ -1,0 +1,16 @@
+build/
+*.o
+*.dylib
+*.a
+FLACAudioComponent.component/
+.DS_Store
+.DS_Store?
+._*
+_
+.Spotlight-V100
+.Trashes
+*.tmp
+*.swp
+*~
+Reference/
+-

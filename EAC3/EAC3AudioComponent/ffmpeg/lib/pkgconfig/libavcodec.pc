@@ -1,0 +1,14 @@
+prefix=/Users/Jonathan/Desktop/ffmpeg-eac3
+exec_prefix=${prefix}
+libdir=/Users/Jonathan/Desktop/ffmpeg-eac3/lib
+includedir=/Users/Jonathan/Desktop/ffmpeg-eac3/include
+
+Name: libavcodec
+Description: FFmpeg codec library
+Version: 58.134.100
+Requires: libavutil >= 56.70.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavcodec -pthread -liconv -lm
+Libs.private: 
+Cflags: -I${includedir}
