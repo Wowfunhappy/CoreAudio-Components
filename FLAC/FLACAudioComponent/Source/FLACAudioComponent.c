@@ -11,7 +11,7 @@
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 // Define DEBUG_LOGGING to enable debug output
-// #define DEBUG_LOGGING 1
+#define DEBUG_LOGGING 1
 
 #ifdef DEBUG_LOGGING
 // Debug logging
@@ -66,8 +66,11 @@ static FLAC__StreamDecoderReadStatus read_callback(const FLAC__StreamDecoder *de
                                                    void *client_data) {
     FLACDecoder *flac = (FLACDecoder *)client_data;
     
+    DebugLog("read_callback: requested %zu bytes, have %u bytes", *bytes, flac->inputBufferUsed);
+    
     if (flac->inputBufferUsed == 0) {
         *bytes = 0;
+        DebugLog("read_callback: No input data, returning END_OF_STREAM");
         return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM;
     }
     
@@ -791,26 +794,41 @@ static OSStatus ProduceOutputData(void *self,
     // Don't reset output buffer - we may have frames from previous decode
     
     // Decode frames if we need more
-    UInt32 requestedFrames = *ioNumberPackets;  // In PCM, packets = frames
+    // Calculate requested frames from byte size
+    UInt32 requestedFrames = *ioOutputDataByteSize / decoder->outputFormat.mBytesPerFrame;
     UInt32 initialFrames = decoder->outputBufferUsed;
     
     DebugLog("ProduceOutputData: Decoding... requestedFrames=%u, bufferedFrames=%u, inputBytes=%u", 
              requestedFrames, decoder->outputBufferUsed, decoder->inputBufferUsed);
     
+    // Keep track of how much data we had before decoding
+    UInt32 inputBytesBeforeDecode = decoder->inputBufferUsed;
+    
     while (decoder->outputBufferUsed < requestedFrames && decoder->inputBufferUsed > 0) {
+        FLAC__bool result = FLAC__stream_decoder_process_single(decoder->decoder);
         FLAC__StreamDecoderState state = FLAC__stream_decoder_get_state(decoder->decoder);
-        if (state == FLAC__STREAM_DECODER_UNINITIALIZED) {
-            DebugLog("ProduceOutputData: Re-initializing decoder after reset");
-            FLAC__stream_decoder_init_stream(decoder->decoder, read_callback, NULL, NULL, NULL, NULL, write_callback, metadata_callback, error_callback, decoder);
-        }
-
-        if (!FLAC__stream_decoder_process_single(decoder->decoder)) {
-            state = FLAC__stream_decoder_get_state(decoder->decoder);
-            DebugLog("ProduceOutputData: Decoder error, state=%d", state);
+        
+        if (!result) {
+            DebugLog("ProduceOutputData: process_single failed, state=%d", state);
             if (state == FLAC__STREAM_DECODER_END_OF_STREAM) {
+                DebugLog("ProduceOutputData: End of stream reached");
+                break;
+            } else if (state == FLAC__STREAM_DECODER_ABORTED) {
+                DebugLog("ProduceOutputData: Decoder aborted!");
                 break;
             }
+        } else {
+            DebugLog("ProduceOutputData: process_single succeeded, state=%d, buffered=%u", 
+                     state, decoder->outputBufferUsed);
         }
+        
+        // If no input was consumed and no output was produced, we might be stuck
+        if (decoder->inputBufferUsed == inputBytesBeforeDecode && 
+            decoder->outputBufferUsed == initialFrames) {
+            DebugLog("ProduceOutputData: No progress made, breaking decode loop");
+            break;
+        }
+        inputBytesBeforeDecode = decoder->inputBufferUsed;
     }
     
     DebugLog("ProduceOutputData: After decode, bufferedFrames=%u (decoded %u frames)", 
@@ -818,8 +836,9 @@ static OSStatus ProduceOutputData(void *self,
     
     // Copy output
     UInt32 framesToCopy = decoder->outputBufferUsed;
-    if (framesToCopy > *ioNumberPackets) {
-        framesToCopy = *ioNumberPackets;
+    UInt32 maxFrames = *ioOutputDataByteSize / decoder->outputFormat.mBytesPerFrame;
+    if (framesToCopy > maxFrames) {
+        framesToCopy = maxFrames;
     }
     
     if (framesToCopy > 0) {
@@ -856,9 +875,23 @@ static OSStatus ProduceOutputData(void *self,
     }
     
     *ioNumberPackets = framesToCopy;
-    *outStatus = (decoder->inputBufferUsed == 0 && framesToCopy == 0) ?
-                 kAudioCodecProduceOutputPacketAtEOF :
-                 kAudioCodecProduceOutputPacketSuccess;
+    
+    // Determine the appropriate status
+    if (framesToCopy > 0) {
+        // We produced output successfully
+        // Check if we likely have more data to decode
+        if (decoder->outputBufferUsed > 0 || decoder->inputBufferUsed >= 4096) {
+            *outStatus = kAudioCodecProduceOutputPacketSuccessHasMore;
+        } else {
+            *outStatus = kAudioCodecProduceOutputPacketSuccess;
+        }
+    } else if (decoder->inputBufferUsed > 0) {
+        // We have input data but couldn't produce output - might need more data
+        *outStatus = kAudioCodecProduceOutputPacketNeedsMoreInputData;
+    } else {
+        // No input data and no output - we need more input
+        *outStatus = kAudioCodecProduceOutputPacketNeedsMoreInputData;
+    }
     
     return noErr;
 }
@@ -868,14 +901,29 @@ static OSStatus Reset(void *self) {
     
     DebugLog("Reset called: self=%p, decoder=%p", self, decoder);
     
-    // Clear buffers first
+    if (!decoder->isInitialized) {
+        return noErr;
+    }
+    
+    // Clear buffers completely
     decoder->inputBufferUsed = 0;
     decoder->outputBufferUsed = 0;
-    
-    // Reset FLAC decoder if it exists
-    if (decoder->decoder) {
-        FLAC__stream_decoder_reset(decoder->decoder);
+    if (decoder->inputBuffer) {
+        memset(decoder->inputBuffer, 0, decoder->inputBufferSize);
     }
+    if (decoder->outputBuffer) {
+        memset(decoder->outputBuffer, 0, decoder->outputBufferFrames * 8 * sizeof(Float32));
+    }
+    
+    // For FLAC, we don't reset the decoder because it would lose the stream metadata
+    // QuickTime doesn't re-send the metadata after a seek, so we just clear our buffers
+    // and let the decoder continue from the new position
+    if (decoder->decoder) {
+        // Just flush any pending data without resetting
+        FLAC__stream_decoder_flush(decoder->decoder);
+    }
+    
+    DebugLog("Reset complete");
     
     return noErr;
 }
