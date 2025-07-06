@@ -13,7 +13,7 @@
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 // Define DEBUG_LOGGING to enable debug output
-#define DEBUG_LOGGING 1
+// #define DEBUG_LOGGING 1
 
 #ifdef DEBUG_LOGGING
 // Debug logging
