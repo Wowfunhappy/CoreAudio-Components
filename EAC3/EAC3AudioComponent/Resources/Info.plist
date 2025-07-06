@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AudioComponents</key>
+	<array>
+		<dict>
+			<key>description</key>
+			<string>EAC3 Decoder</string>
+			<key>factoryFunction</key>
+			<string>EAC3DecoderEntry</string>
+			<key>manufacturer</key>
+			<string>Ac-3</string>
+			<key>name</key>
+			<string>EAC3 Audio Decoder</string>
+			<key>subtype</key>
+			<string>ec-3</string>
+			<key>type</key>
+			<string>adec</string>
+			<key>version</key>
+			<integer>65536</integer>
+		</dict>
+		<dict>
+			<key>description</key>
+			<string>EAC3 Decoder</string>
+			<key>factoryFunction</key>
+			<string>EAC3DecoderEntry</string>
+			<key>manufacturer</key>
+			<string>Ac-3</string>
+			<key>name</key>
+			<string>EAC3 Audio Decoder</string>
+			<key>subtype</key>
+			<string>ec+3</string>
+			<key>type</key>
+			<string>adec</string>
+			<key>version</key>
+			<integer>65536</integer>
+		</dict>
+	</array>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleExecutable</key>
+	<string>EAC3AudioComponent</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.eac3.codec.EAC3AudioComponent</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>EAC3AudioComponent</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>1.0</string>
+</dict>
+</plist>
