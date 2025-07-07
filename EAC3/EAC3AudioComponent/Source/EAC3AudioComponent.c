@@ -13,7 +13,7 @@
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 // Define DEBUG_LOGGING to enable debug output
-// #define DEBUG_LOGGING 1
+#define DEBUG_LOGGING 1
 
 #ifdef DEBUG_LOGGING
 // Debug logging
@@ -790,38 +790,65 @@ static OSStatus ProduceOutputData(void *self,
                 UInt32 requiredFrames = decoder->outputBufferUsed + samples;
                 if (requiredFrames > decoder->outputBufferFrames) {
                     decoder->outputBufferFrames = requiredFrames * 2;
+                    // Always allocate for maximum possible channels to avoid issues
                     decoder->outputBuffer = realloc(decoder->outputBuffer,
-                                               decoder->outputBufferFrames * channels * sizeof(Float32));
+                                               decoder->outputBufferFrames * 8 * sizeof(Float32));
                     if (!decoder->outputBuffer) {
                         return kAudioCodecStateError;
                     }
                 }
                 
-                Float32 *output = decoder->outputBuffer + (decoder->outputBufferUsed * channels);
+                // Use the actual channel count from the output format for consistency
+                UInt32 outputChannels = decoder->outputFormat.mChannelsPerFrame;
+                Float32 *output = decoder->outputBuffer + (decoder->outputBufferUsed * outputChannels);
                 
                 // Handle different sample formats
                 switch (decoder->codecContext->sample_fmt) {
                     case AV_SAMPLE_FMT_FLTP:
                         // Planar float
                         for (UInt32 sample = 0; sample < samples; sample++) {
-                            for (UInt32 channel = 0; channel < channels; channel++) {
-                                float *channelData = (float *)decoder->frame->data[channel];
-                                *output++ = channelData[sample];
+                            for (UInt32 channel = 0; channel < outputChannels; channel++) {
+                                if (channel < channels) {
+                                    float *channelData = (float *)decoder->frame->data[channel];
+                                    *output++ = channelData[sample];
+                                } else {
+                                    // Pad with silence if output has more channels than input
+                                    *output++ = 0.0f;
+                                }
                             }
                         }
                         break;
                         
                     case AV_SAMPLE_FMT_FLT:
                         // Interleaved float
-                        memcpy(output, decoder->frame->data[0], samples * channels * sizeof(float));
+                        if (channels == outputChannels) {
+                            memcpy(output, decoder->frame->data[0], samples * channels * sizeof(float));
+                        } else {
+                            // Need to handle channel count mismatch
+                            float *input = (float *)decoder->frame->data[0];
+                            for (UInt32 sample = 0; sample < samples; sample++) {
+                                for (UInt32 channel = 0; channel < outputChannels; channel++) {
+                                    if (channel < channels) {
+                                        *output++ = input[sample * channels + channel];
+                                    } else {
+                                        *output++ = 0.0f;
+                                    }
+                                }
+                            }
+                        }
                         break;
                         
                     case AV_SAMPLE_FMT_S16P:
                         // Planar 16-bit
                         for (UInt32 sample = 0; sample < samples; sample++) {
-                            for (UInt32 channel = 0; channel < channels; channel++) {
-                                int16_t *channelData = (int16_t *)decoder->frame->data[channel];
-                                *output++ = channelData[sample] / 32768.0f;
+                            for (UInt32 channel = 0; channel < outputChannels; channel++) {
+                                if (channel < channels) {
+                                    int16_t *channelData = (int16_t *)decoder->frame->data[channel];
+                                    *output++ = channelData[sample] / 32768.0f;
+                                } else {
+                                    // Pad with silence if output has more channels than input
+                                    *output++ = 0.0f;
+                                }
                             }
                         }
                         break;
@@ -830,8 +857,14 @@ static OSStatus ProduceOutputData(void *self,
                         // Interleaved 16-bit
                         {
                             int16_t *input = (int16_t *)decoder->frame->data[0];
-                            for (UInt32 i = 0; i < samples * channels; i++) {
-                                *output++ = input[i] / 32768.0f;
+                            for (UInt32 sample = 0; sample < samples; sample++) {
+                                for (UInt32 channel = 0; channel < outputChannels; channel++) {
+                                    if (channel < channels) {
+                                        *output++ = input[sample * channels + channel] / 32768.0f;
+                                    } else {
+                                        *output++ = 0.0f;
+                                    }
+                                }
                             }
                         }
                         break;
@@ -904,9 +937,22 @@ static OSStatus ProduceOutputData(void *self,
         *ioNumberPackets = 0;
     }
     
-    *outStatus = (decoder->inputBufferUsed == 0 && framesToCopy == 0) ?
-                 kAudioCodecProduceOutputPacketAtEOF :
-                 kAudioCodecProduceOutputPacketSuccess;
+    // Determine the appropriate status (same fix as FLAC)
+    if (framesToCopy > 0) {
+        // We produced output successfully
+        // Check if we likely have more data to decode
+        if (decoder->outputBufferUsed > 0 || decoder->inputBufferUsed >= 4096) {
+            *outStatus = kAudioCodecProduceOutputPacketSuccessHasMore;
+        } else {
+            *outStatus = kAudioCodecProduceOutputPacketSuccess;
+        }
+    } else if (decoder->inputBufferUsed > 0) {
+        // We have input data but couldn't produce output - might need more data
+        *outStatus = kAudioCodecProduceOutputPacketNeedsMoreInputData;
+    } else {
+        // No input data and no output - we need more input
+        *outStatus = kAudioCodecProduceOutputPacketNeedsMoreInputData;
+    }
     
     return noErr;
 }
