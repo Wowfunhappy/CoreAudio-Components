@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
@@ -196,6 +197,10 @@ static OSStatus GetProperty(void *self,
             
         case kAudioCodecPropertyCurrentOutputFormat:
             if (*ioPropertyDataSize == sizeof(AudioStreamBasicDescription)) {
+                DebugLog("GetProperty: CurrentOutputFormat - channels=%u, bytesPerFrame=%u, sampleRate=%.0f",
+                         decoder->outputFormat.mChannelsPerFrame,
+                         decoder->outputFormat.mBytesPerFrame,
+                         decoder->outputFormat.mSampleRate);
                 *(AudioStreamBasicDescription *)outPropertyData = decoder->outputFormat;
             } else {
                 return kAudioCodecBadPropertySizeError;
@@ -517,6 +522,12 @@ static OSStatus Initialize(void *self,
     EAC3Decoder *decoder = EAC3_DECODER;
     
     DebugLog("Initialize called! self=%p, decoder=%p", self, decoder);
+    DebugLog("Initialize: Input format - channels=%u, Output format - channels=%u",
+             decoder->inputFormat.mChannelsPerFrame, decoder->outputFormat.mChannelsPerFrame);
+    
+    // Save our desired channel count before QuickTime overwrites it
+    UInt32 desiredChannels = decoder->inputFormat.mChannelsPerFrame;
+    DebugLog("Initialize: Saving original desired channels = %u", desiredChannels);
     
     if (decoder->isInitialized) {
         DebugLog("Initialize: Already initialized");
@@ -530,6 +541,7 @@ static OSStatus Initialize(void *self,
             return kAudioCodecUnsupportedFormatError;
         }
         decoder->inputFormat = *inInputFormat;
+        DebugLog("Initialize: QuickTime provided format with %u channels", inInputFormat->mChannelsPerFrame);
     }
     
     if (inOutputFormat) {
@@ -566,7 +578,7 @@ static OSStatus Initialize(void *self,
         decoder->outputFormat.mSampleRate = decoder->inputFormat.mSampleRate;
     }
     
-    // Calculate output format sizes
+    // Always recalculate output format sizes based on current channel count
     decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
     decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame * decoder->outputFormat.mFramesPerPacket;
     
@@ -576,6 +588,23 @@ static OSStatus Initialize(void *self,
         avcodec_free_context(&decoder->codecContext);
         return kAudioCodecStateError;
     }
+    
+    DebugLog("Initialize: After avcodec_open2 - channels=%d, sample_rate=%d", 
+             decoder->codecContext->channels, decoder->codecContext->sample_rate);
+    
+    // IMPORTANT: avcodec_open2 may reset the channel count to 2 for EAC3
+    // We need to preserve our configured channel count
+    if (desiredChannels > 0) {
+        decoder->codecContext->channels = desiredChannels;
+        decoder->inputFormat.mChannelsPerFrame = desiredChannels;
+        decoder->outputFormat.mChannelsPerFrame = desiredChannels;
+        decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
+        decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame * decoder->outputFormat.mFramesPerPacket;
+        DebugLog("Initialize: Restored channel configuration - channels=%u", decoder->outputFormat.mChannelsPerFrame);
+    }
+    
+    DebugLog("Initialize: Output format after restoration - channels=%u, bytesPerFrame=%u",
+             decoder->outputFormat.mChannelsPerFrame, decoder->outputFormat.mBytesPerFrame);
     
     // Create parser
     decoder->parser = av_parser_init(decoder->codec->id);
@@ -636,6 +665,10 @@ static OSStatus Initialize(void *self,
     decoder->maxPacketSize = 4096;
     
     decoder->isInitialized = true;
+    
+    DebugLog("Initialize: Final output format - channels=%u, bytesPerFrame=%u, sampleRate=%.0f",
+             decoder->outputFormat.mChannelsPerFrame, decoder->outputFormat.mBytesPerFrame,
+             decoder->outputFormat.mSampleRate);
     
     DebugLog("Initialize complete: input=%c%c%c%c output=%c%c%c%c", 
              (char)(decoder->inputFormat.mFormatID >> 24), 
@@ -717,6 +750,52 @@ static OSStatus AppendInputData(void *self,
                      decoder->inputBuffer[0], decoder->inputBuffer[1], 
                      decoder->inputBuffer[2], decoder->inputBuffer[3]);
         }
+        
+        // Probe the stream to detect actual format if not done yet
+        if (decoder->outputFormat.mChannelsPerFrame == 0 && decoder->inputBufferUsed >= 1024) {
+            DebugLog("AppendInputData: Probing stream to detect format...");
+            
+            // Try to parse and decode a frame to get the actual format
+            uint8_t *data = decoder->inputBuffer;
+            int data_size = decoder->inputBufferUsed;
+            uint8_t *out_data = NULL;
+            int out_size = 0;
+            
+            int consumed = av_parser_parse2(decoder->parser, decoder->codecContext,
+                                          &out_data, &out_size,
+                                          data, data_size,
+                                          AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+            
+            if (out_size > 0) {
+                AVPacket probe_pkt = {0};
+                av_init_packet(&probe_pkt);
+                probe_pkt.data = out_data;
+                probe_pkt.size = out_size;
+                
+                // Send packet to decoder
+                int ret = avcodec_send_packet(decoder->codecContext, &probe_pkt);
+                if (ret >= 0) {
+                    // Try to receive a frame
+                    AVFrame *probe_frame = av_frame_alloc();
+                    ret = avcodec_receive_frame(decoder->codecContext, probe_frame);
+                    if (ret >= 0) {
+                        // Got frame info!
+                        DebugLog("AppendInputData: Probe successful - channels=%d, sample_rate=%d",
+                                decoder->codecContext->channels, decoder->codecContext->sample_rate);
+                        
+                        // Update output format
+                        decoder->outputFormat.mChannelsPerFrame = decoder->codecContext->channels;
+                        decoder->outputFormat.mSampleRate = decoder->codecContext->sample_rate;
+                        decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
+                        decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame;
+                        
+                        // Flush decoder to reset state
+                        avcodec_flush_buffers(decoder->codecContext);
+                    }
+                    av_frame_free(&probe_frame);
+                }
+            }
+        }
     }
     
     return noErr;
@@ -746,20 +825,43 @@ static OSStatus ProduceOutputData(void *self,
     DebugLog("ProduceOutputData: Decoding... requestedPackets=%u, requestedBytes=%u (frames=%u), bufferedFrames=%u, inputBytes=%u", 
              *ioNumberPackets, *ioOutputDataByteSize, requestedFrames, decoder->outputBufferUsed, decoder->inputBufferUsed);
     
-    // If we have input data, try to decode it directly as a complete frame
+    // Parse and decode input data
     if (decoder->inputBufferUsed > 0 && decoder->outputBufferUsed < requestedFrames) {
-        // Set packet data directly from input buffer
-        decoder->packet->data = decoder->inputBuffer;
-        decoder->packet->size = decoder->inputBufferUsed;
+        UInt8 *data = decoder->inputBuffer;
+        int data_size = decoder->inputBufferUsed;
         
-        DebugLog("ProduceOutputData: Attempting to decode %d bytes directly", decoder->packet->size);
-        
-        if (decoder->packet->size > 0) {
-            // Send packet to decoder
-            int ret = avcodec_send_packet(decoder->codecContext, decoder->packet);
-            if (ret < 0 && ret != AVERROR_INVALIDDATA) {
-                DebugLog("ProduceOutputData: Error sending packet, ret=%d", ret);
-            } else {
+        while (data_size > 0) {
+            uint8_t *out_data = NULL;
+            int out_size = 0;
+            
+            // Parse the input to extract complete frames
+            int consumed = av_parser_parse2(decoder->parser, decoder->codecContext,
+                                          &out_data, &out_size,
+                                          data, data_size,
+                                          AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+            
+            if (consumed < 0) {
+                DebugLog("ProduceOutputData: Parser error, consumed=%d", consumed);
+                break;
+            }
+            
+            data += consumed;
+            data_size -= consumed;
+            
+            // If parser produced output, decode it
+            if (out_size > 0) {
+                decoder->packet->data = out_data;
+                decoder->packet->size = out_size;
+                
+                DebugLog("ProduceOutputData: Parser produced %d bytes, consumed %d bytes from %d total", 
+                        out_size, consumed, decoder->inputBufferUsed);
+                
+                // Send packet to decoder
+                int ret = avcodec_send_packet(decoder->codecContext, decoder->packet);
+                if (ret < 0 && ret != AVERROR_INVALIDDATA) {
+                    DebugLog("ProduceOutputData: Error sending packet, ret=%d", ret);
+                    continue;
+                }
             
             // Receive frames
             while (ret >= 0) {
@@ -771,11 +873,16 @@ static OSStatus ProduceOutputData(void *self,
                     break;
                 }
                 
-                DebugLog("ProduceOutputData: Decoded frame with %d samples", decoder->frame->nb_samples);
+                DebugLog("ProduceOutputData: Decoded frame with %d samples, channels=%d, sample_rate=%d", 
+                        decoder->frame->nb_samples, decoder->codecContext->channels, 
+                        decoder->codecContext->sample_rate);
                 
                 // Update output format info from decoder if needed
                 if (decoder->codecContext->channels != decoder->outputFormat.mChannelsPerFrame ||
                     decoder->codecContext->sample_rate != decoder->outputFormat.mSampleRate) {
+                    DebugLog("ProduceOutputData: Updating format - channels: %u -> %d, sample_rate: %.0f -> %d",
+                             decoder->outputFormat.mChannelsPerFrame, decoder->codecContext->channels,
+                             decoder->outputFormat.mSampleRate, decoder->codecContext->sample_rate);
                     decoder->outputFormat.mChannelsPerFrame = decoder->codecContext->channels;
                     decoder->outputFormat.mSampleRate = decoder->codecContext->sample_rate;
                     decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
@@ -876,15 +983,23 @@ static OSStatus ProduceOutputData(void *self,
                 }
                 
                 decoder->outputBufferUsed += samples;
-                decoder->packetFrameSize = samples;
-            }
-            }
-            
-            // Clear input buffer after successful decode
-            if (decoder->outputBufferUsed > 0) {
-                decoder->inputBufferUsed = 0;
+                
+                // Update packet frame size based on what decoder produces
+                // EAC3 may use different frame sizes (256, 768, 1536, etc.)
+                if (samples > 0 && samples != decoder->packetFrameSize) {
+                    DebugLog("ProduceOutputData: Adjusting packet frame size from %u to %u based on decoder output", 
+                            decoder->packetFrameSize, samples);
+                    decoder->packetFrameSize = samples;
+                }
+                }
             }
         }
+        
+        // Move any unparsed data to the beginning of the buffer
+        if (data_size > 0 && data != decoder->inputBuffer) {
+            memmove(decoder->inputBuffer, data, data_size);
+        }
+        decoder->inputBufferUsed = data_size;
     }
     
     DebugLog("ProduceOutputData: After decode, bufferedFrames=%u", 
@@ -930,9 +1045,15 @@ static OSStatus ProduceOutputData(void *self,
         *ioOutputDataByteSize = 0;
     }
     
-    // For compressed formats, report packets (1 packet = 1536 frames for EAC3)
+    // For compressed formats, report packets based on actual frame size
     if (framesToCopy > 0) {
-        *ioNumberPackets = (framesToCopy + 1535) / 1536; // Round up
+        // Use the actual frame size from the decoder
+        UInt32 frameSize = decoder->packetFrameSize;
+        if (frameSize == 0) frameSize = 1536; // Default if not set
+        UInt32 packetsProduced = (framesToCopy + frameSize - 1) / frameSize; // Round up
+        DebugLog("ProduceOutputData: framesToCopy=%u, frameSize=%u, packets=%u", 
+                 framesToCopy, frameSize, packetsProduced);
+        *ioNumberPackets = packetsProduced;
     } else {
         *ioNumberPackets = 0;
     }
@@ -1044,7 +1165,7 @@ static OSStatus EAC3OpenProc(void *self, AudioComponentInstance inInstance) {
     decoder->inputFormat.mBytesPerPacket = 0;
     decoder->inputFormat.mFramesPerPacket = 0;
     decoder->inputFormat.mBytesPerFrame = 0;
-    decoder->inputFormat.mChannelsPerFrame = 2;
+    decoder->inputFormat.mChannelsPerFrame = 6;  // Default to 6 channels (5.1 surround)
     decoder->inputFormat.mBitsPerChannel = 0;
     decoder->inputFormat.mSampleRate = 48000;
     
@@ -1052,14 +1173,15 @@ static OSStatus EAC3OpenProc(void *self, AudioComponentInstance inInstance) {
     decoder->outputFormat.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian;
     decoder->outputFormat.mBitsPerChannel = 32;
     decoder->outputFormat.mFramesPerPacket = 1;
-    decoder->outputFormat.mChannelsPerFrame = 2;
-    decoder->outputFormat.mBytesPerFrame = 8;
-    decoder->outputFormat.mBytesPerPacket = 8;
+    decoder->outputFormat.mChannelsPerFrame = 6;  // TEST: Assume 6 channels for now
+    decoder->outputFormat.mBytesPerFrame = 6 * sizeof(Float32);
+    decoder->outputFormat.mBytesPerPacket = 6 * sizeof(Float32);
     decoder->outputFormat.mSampleRate = 48000;
     decoder->packetFrameSize = 1536;
     decoder->maxPacketSize = 4096;
     
-    DebugLog("Initialized decoder at %p", decoder);
+    DebugLog("Initialized decoder at %p - input channels=%u, output channels=%u", 
+             decoder, decoder->inputFormat.mChannelsPerFrame, decoder->outputFormat.mChannelsPerFrame);
     
     return noErr;
 }
