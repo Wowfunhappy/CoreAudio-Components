@@ -877,16 +877,16 @@ static OSStatus ProduceOutputData(void *self,
                         decoder->frame->nb_samples, decoder->codecContext->channels, 
                         decoder->codecContext->sample_rate);
                 
-                // Update output format info from decoder if needed
+                // Log format info but don't update channels - we always output 8 channels
                 if (decoder->codecContext->channels != decoder->outputFormat.mChannelsPerFrame ||
                     decoder->codecContext->sample_rate != decoder->outputFormat.mSampleRate) {
-                    DebugLog("ProduceOutputData: Updating format - channels: %u -> %d, sample_rate: %.0f -> %d",
-                             decoder->outputFormat.mChannelsPerFrame, decoder->codecContext->channels,
-                             decoder->outputFormat.mSampleRate, decoder->codecContext->sample_rate);
-                    decoder->outputFormat.mChannelsPerFrame = decoder->codecContext->channels;
-                    decoder->outputFormat.mSampleRate = decoder->codecContext->sample_rate;
-                    decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
-                    decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame;
+                    DebugLog("ProduceOutputData: Decoder found %d channels (will pad to %u), sample_rate: %d",
+                             decoder->codecContext->channels, decoder->outputFormat.mChannelsPerFrame,
+                             decoder->codecContext->sample_rate);
+                    // Update sample rate if needed, but keep channel count at 8
+                    if (decoder->codecContext->sample_rate != decoder->outputFormat.mSampleRate) {
+                        decoder->outputFormat.mSampleRate = decoder->codecContext->sample_rate;
+                    }
                 }
                 
                 // Convert to float
@@ -1165,7 +1165,7 @@ static OSStatus EAC3OpenProc(void *self, AudioComponentInstance inInstance) {
     decoder->inputFormat.mBytesPerPacket = 0;
     decoder->inputFormat.mFramesPerPacket = 0;
     decoder->inputFormat.mBytesPerFrame = 0;
-    decoder->inputFormat.mChannelsPerFrame = 6;  // Default to 6 channels (5.1 surround)
+    decoder->inputFormat.mChannelsPerFrame = 8;  // Default to 8 channels (7.1 surround)
     decoder->inputFormat.mBitsPerChannel = 0;
     decoder->inputFormat.mSampleRate = 48000;
     
@@ -1173,9 +1173,9 @@ static OSStatus EAC3OpenProc(void *self, AudioComponentInstance inInstance) {
     decoder->outputFormat.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian;
     decoder->outputFormat.mBitsPerChannel = 32;
     decoder->outputFormat.mFramesPerPacket = 1;
-    decoder->outputFormat.mChannelsPerFrame = 6;  // TEST: Assume 6 channels for now
-    decoder->outputFormat.mBytesPerFrame = 6 * sizeof(Float32);
-    decoder->outputFormat.mBytesPerPacket = 6 * sizeof(Float32);
+    decoder->outputFormat.mChannelsPerFrame = 8;  // Default to 8 channels for 7.1 support
+    decoder->outputFormat.mBytesPerFrame = 8 * sizeof(Float32);
+    decoder->outputFormat.mBytesPerPacket = 8 * sizeof(Float32);
     decoder->outputFormat.mSampleRate = 48000;
     decoder->packetFrameSize = 1536;
     decoder->maxPacketSize = 4096;
