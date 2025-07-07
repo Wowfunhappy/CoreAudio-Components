@@ -522,6 +522,12 @@ static OSStatus Initialize(void *self,
     EAC3Decoder *decoder = EAC3_DECODER;
     
     DebugLog("Initialize called! self=%p, decoder=%p", self, decoder);
+    DebugLog("Initialize: Input format - channels=%u, Output format - channels=%u",
+             decoder->inputFormat.mChannelsPerFrame, decoder->outputFormat.mChannelsPerFrame);
+    
+    // Save our desired channel count before QuickTime overwrites it
+    UInt32 desiredChannels = decoder->inputFormat.mChannelsPerFrame;
+    DebugLog("Initialize: Saving original desired channels = %u", desiredChannels);
     
     if (decoder->isInitialized) {
         DebugLog("Initialize: Already initialized");
@@ -535,6 +541,7 @@ static OSStatus Initialize(void *self,
             return kAudioCodecUnsupportedFormatError;
         }
         decoder->inputFormat = *inInputFormat;
+        DebugLog("Initialize: QuickTime provided format with %u channels", inInputFormat->mChannelsPerFrame);
     }
     
     if (inOutputFormat) {
@@ -585,8 +592,19 @@ static OSStatus Initialize(void *self,
     DebugLog("Initialize: After avcodec_open2 - channels=%d, sample_rate=%d", 
              decoder->codecContext->channels, decoder->codecContext->sample_rate);
     
-    // We always output 8 channels regardless of what the decoder finds
-    DebugLog("Initialize: Configured for 8-channel output with silence padding as needed");
+    // IMPORTANT: avcodec_open2 may reset the channel count to 2 for EAC3
+    // We need to preserve our configured channel count
+    if (desiredChannels > 0) {
+        decoder->codecContext->channels = desiredChannels;
+        decoder->inputFormat.mChannelsPerFrame = desiredChannels;
+        decoder->outputFormat.mChannelsPerFrame = desiredChannels;
+        decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
+        decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame * decoder->outputFormat.mFramesPerPacket;
+        DebugLog("Initialize: Restored channel configuration - channels=%u", decoder->outputFormat.mChannelsPerFrame);
+    }
+    
+    DebugLog("Initialize: Output format after restoration - channels=%u, bytesPerFrame=%u",
+             decoder->outputFormat.mChannelsPerFrame, decoder->outputFormat.mBytesPerFrame);
     
     // Create parser
     decoder->parser = av_parser_init(decoder->codec->id);
@@ -733,6 +751,51 @@ static OSStatus AppendInputData(void *self,
                      decoder->inputBuffer[2], decoder->inputBuffer[3]);
         }
         
+        // Probe the stream to detect actual format if not done yet
+        if (decoder->outputFormat.mChannelsPerFrame == 0 && decoder->inputBufferUsed >= 1024) {
+            DebugLog("AppendInputData: Probing stream to detect format...");
+            
+            // Try to parse and decode a frame to get the actual format
+            uint8_t *data = decoder->inputBuffer;
+            int data_size = decoder->inputBufferUsed;
+            uint8_t *out_data = NULL;
+            int out_size = 0;
+            
+            int consumed = av_parser_parse2(decoder->parser, decoder->codecContext,
+                                          &out_data, &out_size,
+                                          data, data_size,
+                                          AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+            
+            if (out_size > 0) {
+                AVPacket probe_pkt = {0};
+                av_init_packet(&probe_pkt);
+                probe_pkt.data = out_data;
+                probe_pkt.size = out_size;
+                
+                // Send packet to decoder
+                int ret = avcodec_send_packet(decoder->codecContext, &probe_pkt);
+                if (ret >= 0) {
+                    // Try to receive a frame
+                    AVFrame *probe_frame = av_frame_alloc();
+                    ret = avcodec_receive_frame(decoder->codecContext, probe_frame);
+                    if (ret >= 0) {
+                        // Got frame info!
+                        DebugLog("AppendInputData: Probe successful - channels=%d, sample_rate=%d",
+                                decoder->codecContext->channels, decoder->codecContext->sample_rate);
+                        
+                        // Update output format
+                        decoder->outputFormat.mChannelsPerFrame = decoder->codecContext->channels;
+                        decoder->outputFormat.mSampleRate = decoder->codecContext->sample_rate;
+                        decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
+                        decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame;
+                        
+                        // Flush decoder to reset state
+                        avcodec_flush_buffers(decoder->codecContext);
+                    }
+                    av_frame_free(&probe_frame);
+                }
+            }
+        }
     }
     
     return noErr;
