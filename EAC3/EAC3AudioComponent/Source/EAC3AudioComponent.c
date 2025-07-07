@@ -518,8 +518,8 @@ static OSStatus SetProperty(void *self,
     }
 }
 
-// Helper function to get the system's default output device channel count
-static UInt32 GetSystemOutputChannelCount(void) {
+// Helper function to get the system's default output device channel layout
+static AudioChannelLayout* GetSystemOutputChannelLayout(UInt32 *outChannelCount) {
     AudioDeviceID deviceID;
     UInt32 propertySize = sizeof(deviceID);
     
@@ -533,28 +533,81 @@ static UInt32 GetSystemOutputChannelCount(void) {
     OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress,
                                                 0, NULL, &propertySize, &deviceID);
     if (status != noErr || deviceID == kAudioDeviceUnknown) {
-        DebugLog("GetSystemOutputChannelCount: Failed to get default output device");
-        return 2; // Default to stereo
+        DebugLog("GetSystemOutputChannelLayout: Failed to get default output device");
+        if (outChannelCount) *outChannelCount = 2;
+        return NULL;
     }
     
-    // Get the device's stream configuration
+    // Try to get preferred channel layout
+    propertyAddress.mSelector = kAudioDevicePropertyPreferredChannelLayout;
+    propertyAddress.mScope = kAudioDevicePropertyScopeOutput;
+    
+    status = AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, NULL, &propertySize);
+    if (status == noErr && propertySize > 0) {
+        AudioChannelLayout *layout = (AudioChannelLayout *)malloc(propertySize);
+        if (layout) {
+            status = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, NULL, &propertySize, layout);
+            if (status == noErr) {
+                DebugLog("GetSystemOutputChannelLayout: Got preferred channel layout, tag=%u, channels=%u", 
+                         layout->mChannelLayoutTag, layout->mNumberChannelDescriptions);
+                
+                // Log individual channel descriptions if using channel descriptions
+                if (layout->mChannelLayoutTag == kAudioChannelLayoutTag_UseChannelDescriptions) {
+                    DebugLog("GetSystemOutputChannelLayout: Using channel descriptions, count=%u", 
+                             layout->mNumberChannelDescriptions);
+                    for (UInt32 i = 0; i < layout->mNumberChannelDescriptions; i++) {
+                        AudioChannelDescription *desc = &layout->mChannelDescriptions[i];
+                        DebugLog("  Channel %u: label=%u, flags=0x%x, coords=[%f,%f,%f]", 
+                                 i, desc->mChannelLabel, desc->mChannelFlags,
+                                 desc->mCoordinates[0], desc->mCoordinates[1], desc->mCoordinates[2]);
+                    }
+                }
+                
+                // Get channel count from layout
+                if (outChannelCount) {
+                    if (layout->mChannelLayoutTag != kAudioChannelLayoutTag_UseChannelDescriptions) {
+                        // Get channel count from layout tag
+                        UInt32 channelCount = 0;
+                        UInt32 propSize = sizeof(channelCount);
+                        AudioFormatGetProperty(kAudioFormatProperty_NumberOfChannelsForLayout,
+                                             sizeof(AudioChannelLayoutTag), &layout->mChannelLayoutTag,
+                                             &propSize, &channelCount);
+                        *outChannelCount = channelCount;
+                    } else {
+                        *outChannelCount = layout->mNumberChannelDescriptions;
+                    }
+                }
+                return layout;
+            }
+            free(layout);
+        }
+    }
+    
+    DebugLog("GetSystemOutputChannelLayout: No preferred channel layout, falling back to stream config");
+    
+    // Fall back to getting channel count from stream configuration
     propertyAddress.mSelector = kAudioDevicePropertyStreamConfiguration;
     propertyAddress.mScope = kAudioDevicePropertyScopeOutput;
     
     status = AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, NULL, &propertySize);
     if (status != noErr) {
-        DebugLog("GetSystemOutputChannelCount: Failed to get stream config size");
-        return 2;
+        DebugLog("GetSystemOutputChannelLayout: Failed to get stream config size");
+        if (outChannelCount) *outChannelCount = 2;
+        return NULL;
     }
     
     AudioBufferList *bufferList = (AudioBufferList *)malloc(propertySize);
-    if (!bufferList) return 2;
+    if (!bufferList) {
+        if (outChannelCount) *outChannelCount = 2;
+        return NULL;
+    }
     
     status = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, NULL, &propertySize, bufferList);
     if (status != noErr) {
         free(bufferList);
-        DebugLog("GetSystemOutputChannelCount: Failed to get stream config");
-        return 2;
+        DebugLog("GetSystemOutputChannelLayout: Failed to get stream config");
+        if (outChannelCount) *outChannelCount = 2;
+        return NULL;
     }
     
     // Count total channels
@@ -564,7 +617,115 @@ static UInt32 GetSystemOutputChannelCount(void) {
     }
     
     free(bufferList);
-    DebugLog("GetSystemOutputChannelCount: System has %u output channels", channelCount);
+    DebugLog("GetSystemOutputChannelLayout: System has %u output channels (from stream config)", channelCount);
+    if (outChannelCount) *outChannelCount = channelCount;
+    return NULL;
+}
+
+// Helper function to get the actual channel layout from system descriptions
+static int64_t GetActualChannelLayout(AudioChannelLayout *layout, UInt32 *outActualChannels) {
+    if (!layout) return 0;
+    
+    // If we have a specific layout tag, use it
+    if (layout->mChannelLayoutTag != kAudioChannelLayoutTag_UseChannelDescriptions) {
+        if (outActualChannels) {
+            UInt32 channelCount = 0;
+            UInt32 propSize = sizeof(channelCount);
+            AudioFormatGetProperty(kAudioFormatProperty_NumberOfChannelsForLayout,
+                                 sizeof(AudioChannelLayoutTag), &layout->mChannelLayoutTag,
+                                 &propSize, &channelCount);
+            *outActualChannels = channelCount;
+        }
+        
+        // Convert CoreAudio layout tag to FFmpeg layout
+        switch (layout->mChannelLayoutTag) {
+            case kAudioChannelLayoutTag_Mono:
+                return AV_CH_LAYOUT_MONO;
+            case kAudioChannelLayoutTag_Stereo:
+                return AV_CH_LAYOUT_STEREO;
+            case kAudioChannelLayoutTag_Quadraphonic:
+                return AV_CH_LAYOUT_QUAD;
+            case kAudioChannelLayoutTag_MPEG_5_1_D:
+                return AV_CH_LAYOUT_5POINT1;
+            case kAudioChannelLayoutTag_MPEG_7_1_A:
+            case kAudioChannelLayoutTag_MPEG_7_1_B:
+            case kAudioChannelLayoutTag_MPEG_7_1_C:
+            case kAudioChannelLayoutTag_Emagic_Default_7_1:
+            case kAudioChannelLayoutTag_AAC_7_1_B:
+            case kAudioChannelLayoutTag_AAC_7_1_C:
+                return AV_CH_LAYOUT_7POINT1;
+            default:
+                return 0;
+        }
+    }
+    
+    // Build layout from channel descriptions
+    int64_t channelLayout = 0;
+    UInt32 validChannels = 0;
+    
+    for (UInt32 i = 0; i < layout->mNumberChannelDescriptions; i++) {
+        AudioChannelLabel label = layout->mChannelDescriptions[i].mChannelLabel;
+        
+        // Skip invalid/unknown channels
+        if (label == kAudioChannelLabel_Unknown || label == 0xFFFFFFFF) {
+            continue;
+        }
+        
+        validChannels++;
+        
+        // Map CoreAudio labels to FFmpeg channel flags
+        switch (label) {
+            case kAudioChannelLabel_Left:
+                channelLayout |= AV_CH_FRONT_LEFT;
+                break;
+            case kAudioChannelLabel_Right:
+                channelLayout |= AV_CH_FRONT_RIGHT;
+                break;
+            case kAudioChannelLabel_Center:
+                channelLayout |= AV_CH_FRONT_CENTER;
+                break;
+            case kAudioChannelLabel_LFEScreen:
+                channelLayout |= AV_CH_LOW_FREQUENCY;
+                break;
+            case kAudioChannelLabel_LeftSurround:
+                channelLayout |= AV_CH_BACK_LEFT;
+                break;
+            case kAudioChannelLabel_RightSurround:
+                channelLayout |= AV_CH_BACK_RIGHT;
+                break;
+            case kAudioChannelLabel_LeftCenter:
+                channelLayout |= AV_CH_FRONT_LEFT_OF_CENTER;
+                break;
+            case kAudioChannelLabel_RightCenter:
+                channelLayout |= AV_CH_FRONT_RIGHT_OF_CENTER;
+                break;
+            case kAudioChannelLabel_CenterSurround:
+                channelLayout |= AV_CH_BACK_CENTER;
+                break;
+            case kAudioChannelLabel_LeftSurroundDirect:
+                channelLayout |= AV_CH_SIDE_LEFT;
+                break;
+            case kAudioChannelLabel_RightSurroundDirect:
+                channelLayout |= AV_CH_SIDE_RIGHT;
+                break;
+        }
+    }
+    
+    if (outActualChannels) {
+        *outActualChannels = validChannels;
+    }
+    
+    DebugLog("GetActualChannelLayout: Built channel layout 0x%llx with %u valid channels", 
+             (unsigned long long)channelLayout, validChannels);
+    
+    return channelLayout;
+}
+
+// Helper function to get the system's default output device channel count
+static UInt32 GetSystemOutputChannelCount(void) {
+    UInt32 channelCount = 2;
+    AudioChannelLayout *layout = GetSystemOutputChannelLayout(&channelCount);
+    if (layout) free(layout);
     return channelCount;
 }
 
@@ -957,7 +1118,19 @@ static OSStatus ProduceOutputData(void *self,
                 // Get channel counts
                 UInt32 channels = decoder->codecContext->channels;
                 UInt32 outputChannels = decoder->outputFormat.mChannelsPerFrame;  // Always 8
-                UInt32 systemChannels = GetSystemOutputChannelCount();  // Actual speaker count
+                UInt32 systemChannels = 0;
+                AudioChannelLayout *systemLayout = GetSystemOutputChannelLayout(&systemChannels);
+                
+                // Get the actual system channel layout and valid channel count
+                UInt32 actualSystemChannels = systemChannels;
+                int64_t actualSystemLayout = GetActualChannelLayout(systemLayout, &actualSystemChannels);
+                
+                // Use actual valid channels for comparison
+                if (actualSystemLayout != 0 && actualSystemChannels < systemChannels) {
+                    DebugLog("ProduceOutputData: System reports %u channels but only %u are valid", 
+                             systemChannels, actualSystemChannels);
+                    systemChannels = actualSystemChannels;
+                }
                 
                 // Check if speaker configuration changed
                 if (decoder->swrContext && decoder->lastSystemChannels != systemChannels) {
@@ -967,6 +1140,7 @@ static OSStatus ProduceOutputData(void *self,
                 }
                 
                 // Set up swresample if needed for channel conversion to system speakers
+                // Always set up swresample when content channels don't match system channels
                 if (!decoder->swrContext && channels != systemChannels) {
                     decoder->swrContext = swr_alloc();
                     if (!decoder->swrContext) {
@@ -976,7 +1150,30 @@ static OSStatus ProduceOutputData(void *self,
                     
                     // Set up channel layouts - downmix to system speaker configuration
                     int64_t in_channel_layout = av_get_default_channel_layout(channels);
-                    int64_t out_channel_layout = av_get_default_channel_layout(systemChannels);
+                    
+                    // Check if we have 6 channels and determine if it's 5.1 or 5.1(side)
+                    if (channels == 6 && decoder->codecContext->channel_layout != 0) {
+                        in_channel_layout = decoder->codecContext->channel_layout;
+                        DebugLog("ProduceOutputData: Using codec's channel layout: 0x%llx", (unsigned long long)in_channel_layout);
+                    }
+                    
+                    int64_t out_channel_layout;
+                    
+                    // Use the actual system channel layout if we got one
+                    if (actualSystemLayout != 0) {
+                        out_channel_layout = actualSystemLayout;
+                        DebugLog("ProduceOutputData: Using actual system channel layout");
+                    } else {
+                        // Fall back to FFmpeg's default for the channel count
+                        out_channel_layout = av_get_default_channel_layout(systemChannels);
+                        DebugLog("ProduceOutputData: Using default layout for %u channels", systemChannels);
+                    }
+                    
+                    // Log the channel layouts for debugging
+                    char in_layout_str[64], out_layout_str[64];
+                    av_get_channel_layout_string(in_layout_str, sizeof(in_layout_str), channels, in_channel_layout);
+                    av_get_channel_layout_string(out_layout_str, sizeof(out_layout_str), systemChannels, out_channel_layout);
+                    DebugLog("ProduceOutputData: Channel layouts - in: %s, out: %s", in_layout_str, out_layout_str);
                     
                     // Configure swresample to downmix to system channels
                     av_opt_set_int(decoder->swrContext, "in_channel_layout", in_channel_layout, 0);
@@ -985,6 +1182,16 @@ static OSStatus ProduceOutputData(void *self,
                     av_opt_set_int(decoder->swrContext, "out_sample_rate", decoder->codecContext->sample_rate, 0);
                     av_opt_set_sample_fmt(decoder->swrContext, "in_sample_fmt", decoder->codecContext->sample_fmt, 0);
                     av_opt_set_sample_fmt(decoder->swrContext, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
+                    
+                    // Set appropriate downmix coefficients for better quality
+                    // These work for any downmix scenario
+                    av_opt_set_double(decoder->swrContext, "rematrix_volume", 1.0, 0);
+                    av_opt_set_double(decoder->swrContext, "center_mix_level", 0.707, 0);
+                    av_opt_set_double(decoder->swrContext, "lfe_mix_level", 0.25, 0);
+                    av_opt_set_double(decoder->swrContext, "surround_mix_level", 1.0, 0);
+                    
+                    DebugLog("ProduceOutputData: Set downmix coefficients for %d -> %u channel conversion", 
+                             channels, systemChannels);
                     
                     if (swr_init(decoder->swrContext) < 0) {
                         DebugLog("ProduceOutputData: Failed to initialize swresample");
@@ -1138,6 +1345,11 @@ static OSStatus ProduceOutputData(void *self,
                     free(tempBuffer);
                     DebugLog("ProduceOutputData: Converted %u samples with %u channels, padded to %u", 
                              samples, channels, outputChannels);
+                }
+                
+                // Clean up system layout
+                if (systemLayout) {
+                    free(systemLayout);
                 }
                 
                 decoder->outputBufferUsed += samples;
