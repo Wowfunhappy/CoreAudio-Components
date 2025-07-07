@@ -12,7 +12,7 @@ LDFLAGS = -arch x86_64 -bundle -flat_namespace -undefined suppress \
           -framework AudioUnit \
           -framework AudioToolbox \
           -L./EAC3AudioComponent/ffmpeg/lib \
-          -lavcodec -lavutil
+          -lavcodec -lavutil -lswresample
 
 TARGET = build/EAC3.component
 

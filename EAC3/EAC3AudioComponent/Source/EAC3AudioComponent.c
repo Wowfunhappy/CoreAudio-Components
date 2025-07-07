@@ -2,9 +2,11 @@
 #include <AudioUnit/AudioCodec.h>
 #include <AudioUnit/AudioComponent.h>
 #include <AudioToolbox/AudioToolbox.h>
+#include <CoreAudio/CoreAudio.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
+#include <libswresample/swresample.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -52,6 +54,7 @@ typedef struct EAC3Decoder {
     AVCodecParserContext *parser;
     AVFrame *frame;
     AVPacket *packet;
+    SwrContext *swrContext;  // For channel downmixing
     
     UInt8 *inputBuffer;
     UInt32 inputBufferSize;
@@ -514,6 +517,56 @@ static OSStatus SetProperty(void *self,
     }
 }
 
+// Helper function to get the system's default output device channel count
+static UInt32 GetSystemOutputChannelCount(void) {
+    AudioDeviceID deviceID;
+    UInt32 propertySize = sizeof(deviceID);
+    
+    // Get the default output device
+    AudioObjectPropertyAddress propertyAddress = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMaster
+    };
+    
+    OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress,
+                                                0, NULL, &propertySize, &deviceID);
+    if (status != noErr || deviceID == kAudioDeviceUnknown) {
+        DebugLog("GetSystemOutputChannelCount: Failed to get default output device");
+        return 2; // Default to stereo
+    }
+    
+    // Get the device's stream configuration
+    propertyAddress.mSelector = kAudioDevicePropertyStreamConfiguration;
+    propertyAddress.mScope = kAudioDevicePropertyScopeOutput;
+    
+    status = AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, NULL, &propertySize);
+    if (status != noErr) {
+        DebugLog("GetSystemOutputChannelCount: Failed to get stream config size");
+        return 2;
+    }
+    
+    AudioBufferList *bufferList = (AudioBufferList *)malloc(propertySize);
+    if (!bufferList) return 2;
+    
+    status = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, NULL, &propertySize, bufferList);
+    if (status != noErr) {
+        free(bufferList);
+        DebugLog("GetSystemOutputChannelCount: Failed to get stream config");
+        return 2;
+    }
+    
+    // Count total channels
+    UInt32 channelCount = 0;
+    for (UInt32 i = 0; i < bufferList->mNumberBuffers; i++) {
+        channelCount += bufferList->mBuffers[i].mNumberChannels;
+    }
+    
+    free(bufferList);
+    DebugLog("GetSystemOutputChannelCount: System has %u output channels", channelCount);
+    return channelCount;
+}
+
 static OSStatus Initialize(void *self,
                           const AudioStreamBasicDescription *inInputFormat,
                           const AudioStreamBasicDescription *inOutputFormat,
@@ -525,8 +578,13 @@ static OSStatus Initialize(void *self,
     DebugLog("Initialize: Input format - channels=%u, Output format - channels=%u",
              decoder->inputFormat.mChannelsPerFrame, decoder->outputFormat.mChannelsPerFrame);
     
+    // Check system audio configuration
+    UInt32 systemChannels = GetSystemOutputChannelCount();
+    DebugLog("Initialize: System audio output has %u channels", systemChannels);
+    
     // Save our desired channel count before QuickTime overwrites it
     UInt32 desiredChannels = decoder->inputFormat.mChannelsPerFrame;
+    UInt32 requestedOutputChannels = decoder->outputFormat.mChannelsPerFrame;  // Save current output channels
     DebugLog("Initialize: Saving original desired channels = %u", desiredChannels);
     
     if (decoder->isInitialized) {
@@ -552,6 +610,8 @@ static OSStatus Initialize(void *self,
             return kAudioCodecUnsupportedFormatError;
         }
         decoder->outputFormat = *inOutputFormat;
+        requestedOutputChannels = inOutputFormat->mChannelsPerFrame;
+        DebugLog("Initialize: QuickTime requested %u output channels", inOutputFormat->mChannelsPerFrame);
     }
     
     // Find EAC3 decoder
@@ -593,14 +653,25 @@ static OSStatus Initialize(void *self,
              decoder->codecContext->channels, decoder->codecContext->sample_rate);
     
     // IMPORTANT: avcodec_open2 may reset the channel count to 2 for EAC3
-    // We need to preserve our configured channel count
+    // We need to preserve our configured channel count for INPUT
     if (desiredChannels > 0) {
         decoder->codecContext->channels = desiredChannels;
         decoder->inputFormat.mChannelsPerFrame = desiredChannels;
-        decoder->outputFormat.mChannelsPerFrame = desiredChannels;
+        
+        // For output, temporarily use 8 channels while debugging downmixing issues
+        decoder->outputFormat.mChannelsPerFrame = 8;
+        DebugLog("Initialize: Using 8 output channels (system has %u) - debugging downmix issues", 
+                 systemChannels);
+        
+        // TODO: Re-enable this once we fix the audio artifacts
+        // if (systemChannels > 0 && systemChannels <= 8) {
+        //     decoder->outputFormat.mChannelsPerFrame = systemChannels;
+        // }
+        
         decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
         decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame * decoder->outputFormat.mFramesPerPacket;
-        DebugLog("Initialize: Restored channel configuration - channels=%u", decoder->outputFormat.mChannelsPerFrame);
+        DebugLog("Initialize: Input channels=%u, Output channels=%u", 
+                 decoder->inputFormat.mChannelsPerFrame, decoder->outputFormat.mChannelsPerFrame);
     }
     
     DebugLog("Initialize: Output format after restoration - channels=%u, bytesPerFrame=%u",
@@ -709,6 +780,10 @@ static OSStatus Uninitialize(void *self) {
         avcodec_free_context(&decoder->codecContext);
     }
     
+    if (decoder->swrContext) {
+        swr_free(&decoder->swrContext);
+    }
+    
     free(decoder->inputBuffer);
     decoder->inputBuffer = NULL;
     
@@ -783,11 +858,11 @@ static OSStatus AppendInputData(void *self,
                         DebugLog("AppendInputData: Probe successful - channels=%d, sample_rate=%d",
                                 decoder->codecContext->channels, decoder->codecContext->sample_rate);
                         
-                        // Update output format
-                        decoder->outputFormat.mChannelsPerFrame = decoder->codecContext->channels;
+                        // Update sample rate but preserve output channel configuration
+                        // DO NOT change output channels - we use system speaker configuration
                         decoder->outputFormat.mSampleRate = decoder->codecContext->sample_rate;
-                        decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
-                        decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame;
+                        DebugLog("AppendInputData: Probe found %d input channels, keeping output at %u channels",
+                                decoder->codecContext->channels, decoder->outputFormat.mChannelsPerFrame);
                         
                         // Flush decoder to reset state
                         avcodec_flush_buffers(decoder->codecContext);
@@ -877,21 +952,55 @@ static OSStatus ProduceOutputData(void *self,
                         decoder->frame->nb_samples, decoder->codecContext->channels, 
                         decoder->codecContext->sample_rate);
                 
-                // Log format info but don't update channels - we always output 8 channels
+                // Get channel counts
+                UInt32 channels = decoder->codecContext->channels;
+                UInt32 outputChannels = decoder->outputFormat.mChannelsPerFrame;  // Always 8
+                UInt32 systemChannels = GetSystemOutputChannelCount();  // Actual speaker count
+                
+                // Set up swresample if needed for channel conversion to system speakers
+                if (!decoder->swrContext && channels != systemChannels) {
+                    decoder->swrContext = swr_alloc();
+                    if (!decoder->swrContext) {
+                        DebugLog("ProduceOutputData: Failed to allocate swresample context");
+                        continue;
+                    }
+                    
+                    // Set up channel layouts - downmix to system speaker configuration
+                    int64_t in_channel_layout = av_get_default_channel_layout(channels);
+                    int64_t out_channel_layout = av_get_default_channel_layout(systemChannels);
+                    
+                    // Configure swresample to downmix to system channels
+                    av_opt_set_int(decoder->swrContext, "in_channel_layout", in_channel_layout, 0);
+                    av_opt_set_int(decoder->swrContext, "out_channel_layout", out_channel_layout, 0);
+                    av_opt_set_int(decoder->swrContext, "in_sample_rate", decoder->codecContext->sample_rate, 0);
+                    av_opt_set_int(decoder->swrContext, "out_sample_rate", decoder->codecContext->sample_rate, 0);
+                    av_opt_set_sample_fmt(decoder->swrContext, "in_sample_fmt", decoder->codecContext->sample_fmt, 0);
+                    av_opt_set_sample_fmt(decoder->swrContext, "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
+                    
+                    if (swr_init(decoder->swrContext) < 0) {
+                        DebugLog("ProduceOutputData: Failed to initialize swresample");
+                        swr_free(&decoder->swrContext);
+                        continue;
+                    }
+                    
+                    DebugLog("ProduceOutputData: Initialized swresample for %d -> %u channels (will pad to %u)", 
+                             channels, systemChannels, outputChannels);
+                }
+                
+                // Log format info
                 if (decoder->codecContext->channels != decoder->outputFormat.mChannelsPerFrame ||
                     decoder->codecContext->sample_rate != decoder->outputFormat.mSampleRate) {
-                    DebugLog("ProduceOutputData: Decoder found %d channels (will pad to %u), sample_rate: %d",
+                    DebugLog("ProduceOutputData: Decoder found %d channels (will output %u channels), sample_rate: %d",
                              decoder->codecContext->channels, decoder->outputFormat.mChannelsPerFrame,
                              decoder->codecContext->sample_rate);
-                    // Update sample rate if needed, but keep channel count at 8
+                    // Update sample rate if needed
                     if (decoder->codecContext->sample_rate != decoder->outputFormat.mSampleRate) {
                         decoder->outputFormat.mSampleRate = decoder->codecContext->sample_rate;
                     }
                 }
                 
-                // Convert to float
+                // Process audio samples
                 UInt32 samples = decoder->frame->nb_samples;
-                UInt32 channels = decoder->codecContext->channels;
                 
                 // Ensure we have enough space
                 UInt32 requiredFrames = decoder->outputBufferUsed + samples;
@@ -905,81 +1014,118 @@ static OSStatus ProduceOutputData(void *self,
                     }
                 }
                 
-                // Use the actual channel count from the output format for consistency
-                UInt32 outputChannels = decoder->outputFormat.mChannelsPerFrame;
-                Float32 *output = decoder->outputBuffer + (decoder->outputBufferUsed * outputChannels);
+                // Use the actual channel count from the output format
+                Float32 *outputPtr = decoder->outputBuffer + (decoder->outputBufferUsed * outputChannels);
                 
-                // Handle different sample formats
-                switch (decoder->codecContext->sample_fmt) {
-                    case AV_SAMPLE_FMT_FLTP:
-                        // Planar float
-                        for (UInt32 sample = 0; sample < samples; sample++) {
-                            for (UInt32 channel = 0; channel < outputChannels; channel++) {
-                                if (channel < channels) {
+                if (decoder->swrContext) {
+                    // Allocate temporary buffer for downmixed audio
+                    Float32 *downmixBuffer = (Float32 *)malloc(samples * systemChannels * sizeof(Float32));
+                    if (!downmixBuffer) {
+                        DebugLog("ProduceOutputData: Failed to allocate downmix buffer");
+                        continue;
+                    }
+                    
+                    // Use swresample to downmix to system channels
+                    uint8_t *out_buffers[1] = { (uint8_t *)downmixBuffer };
+                    
+                    int converted_samples = swr_convert(decoder->swrContext,
+                                                      out_buffers, samples,
+                                                      (const uint8_t **)decoder->frame->data, samples);
+                    
+                    if (converted_samples < 0) {
+                        DebugLog("ProduceOutputData: swr_convert failed");
+                        free(downmixBuffer);
+                        continue;
+                    }
+                    
+                    // Now copy downmixed audio to output buffer with padding for 8 channels
+                    for (UInt32 sample = 0; sample < samples; sample++) {
+                        // Copy system channels
+                        for (UInt32 ch = 0; ch < systemChannels; ch++) {
+                            outputPtr[sample * outputChannels + ch] = downmixBuffer[sample * systemChannels + ch];
+                        }
+                        // Pad remaining channels with silence
+                        for (UInt32 ch = systemChannels; ch < outputChannels; ch++) {
+                            outputPtr[sample * outputChannels + ch] = 0.0f;
+                        }
+                    }
+                    
+                    free(downmixBuffer);
+                    
+                    DebugLog("ProduceOutputData: Downmixed %d samples from %d to %u channels, padded to %u", 
+                             converted_samples, channels, systemChannels, outputChannels);
+                } else {
+                    // No downmixing needed, but still need to handle format conversion and padding
+                    // Create temporary buffer for conversion
+                    Float32 *tempBuffer = (Float32 *)malloc(samples * channels * sizeof(Float32));
+                    if (!tempBuffer) {
+                        DebugLog("ProduceOutputData: Failed to allocate temp buffer");
+                        continue;
+                    }
+                    
+                    Float32 *tempPtr = tempBuffer;
+                    
+                    // Handle different sample formats
+                    switch (decoder->codecContext->sample_fmt) {
+                        case AV_SAMPLE_FMT_FLTP:
+                            // Planar float - convert to interleaved
+                            for (UInt32 sample = 0; sample < samples; sample++) {
+                                for (UInt32 channel = 0; channel < channels; channel++) {
                                     float *channelData = (float *)decoder->frame->data[channel];
-                                    *output++ = channelData[sample];
-                                } else {
-                                    // Pad with silence if output has more channels than input
-                                    *output++ = 0.0f;
+                                    *tempPtr++ = channelData[sample];
                                 }
                             }
-                        }
-                        break;
-                        
-                    case AV_SAMPLE_FMT_FLT:
-                        // Interleaved float
-                        if (channels == outputChannels) {
-                            memcpy(output, decoder->frame->data[0], samples * channels * sizeof(float));
-                        } else {
-                            // Need to handle channel count mismatch
-                            float *input = (float *)decoder->frame->data[0];
+                            break;
+                            
+                        case AV_SAMPLE_FMT_FLT:
+                            // Interleaved float - just copy
+                            memcpy(tempBuffer, decoder->frame->data[0], samples * channels * sizeof(float));
+                            break;
+                            
+                        case AV_SAMPLE_FMT_S16P:
+                            // Planar 16-bit - convert to interleaved float
                             for (UInt32 sample = 0; sample < samples; sample++) {
-                                for (UInt32 channel = 0; channel < outputChannels; channel++) {
-                                    if (channel < channels) {
-                                        *output++ = input[sample * channels + channel];
-                                    } else {
-                                        *output++ = 0.0f;
-                                    }
-                                }
-                            }
-                        }
-                        break;
-                        
-                    case AV_SAMPLE_FMT_S16P:
-                        // Planar 16-bit
-                        for (UInt32 sample = 0; sample < samples; sample++) {
-                            for (UInt32 channel = 0; channel < outputChannels; channel++) {
-                                if (channel < channels) {
+                                for (UInt32 channel = 0; channel < channels; channel++) {
                                     int16_t *channelData = (int16_t *)decoder->frame->data[channel];
-                                    *output++ = channelData[sample] / 32768.0f;
-                                } else {
-                                    // Pad with silence if output has more channels than input
-                                    *output++ = 0.0f;
+                                    *tempPtr++ = channelData[sample] / 32768.0f;
                                 }
                             }
-                        }
-                        break;
-                        
-                    case AV_SAMPLE_FMT_S16:
-                        // Interleaved 16-bit
-                        {
-                            int16_t *input = (int16_t *)decoder->frame->data[0];
-                            for (UInt32 sample = 0; sample < samples; sample++) {
-                                for (UInt32 channel = 0; channel < outputChannels; channel++) {
-                                    if (channel < channels) {
-                                        *output++ = input[sample * channels + channel] / 32768.0f;
-                                    } else {
-                                        *output++ = 0.0f;
+                            break;
+                            
+                        case AV_SAMPLE_FMT_S16:
+                            // Interleaved 16-bit - convert to float
+                            {
+                                int16_t *input = (int16_t *)decoder->frame->data[0];
+                                for (UInt32 sample = 0; sample < samples; sample++) {
+                                    for (UInt32 channel = 0; channel < channels; channel++) {
+                                        *tempPtr++ = input[sample * channels + channel] / 32768.0f;
                                     }
                                 }
                             }
+                            break;
+                            
+                        default:
+                            DebugLog("ProduceOutputData: Unsupported sample format %d", 
+                                    decoder->codecContext->sample_fmt);
+                            free(tempBuffer);
+                            continue;
+                    }
+                    
+                    // Now copy to output buffer with padding to 8 channels
+                    for (UInt32 sample = 0; sample < samples; sample++) {
+                        // Copy actual channels
+                        for (UInt32 ch = 0; ch < channels && ch < outputChannels; ch++) {
+                            outputPtr[sample * outputChannels + ch] = tempBuffer[sample * channels + ch];
                         }
-                        break;
-                        
-                    default:
-                        DebugLog("ProduceOutputData: Unsupported sample format %d", 
-                                decoder->codecContext->sample_fmt);
-                        break;
+                        // Pad remaining channels with silence
+                        for (UInt32 ch = channels; ch < outputChannels; ch++) {
+                            outputPtr[sample * outputChannels + ch] = 0.0f;
+                        }
+                    }
+                    
+                    free(tempBuffer);
+                    DebugLog("ProduceOutputData: Converted %u samples with %u channels, padded to %u", 
+                             samples, channels, outputChannels);
                 }
                 
                 decoder->outputBufferUsed += samples;
