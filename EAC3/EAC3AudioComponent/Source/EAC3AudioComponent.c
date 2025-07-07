@@ -55,6 +55,7 @@ typedef struct EAC3Decoder {
     AVFrame *frame;
     AVPacket *packet;
     SwrContext *swrContext;  // For channel downmixing
+    UInt32 lastSystemChannels;  // To detect speaker configuration changes
     
     UInt8 *inputBuffer;
     UInt32 inputBufferSize;
@@ -734,6 +735,7 @@ static OSStatus Initialize(void *self,
     // EAC3 frame size is 1536 samples
     decoder->packetFrameSize = 1536;
     decoder->maxPacketSize = 4096;
+    decoder->lastSystemChannels = 0;  // Will be set when swresample is initialized
     
     decoder->isInitialized = true;
     
@@ -957,6 +959,13 @@ static OSStatus ProduceOutputData(void *self,
                 UInt32 outputChannels = decoder->outputFormat.mChannelsPerFrame;  // Always 8
                 UInt32 systemChannels = GetSystemOutputChannelCount();  // Actual speaker count
                 
+                // Check if speaker configuration changed
+                if (decoder->swrContext && decoder->lastSystemChannels != systemChannels) {
+                    DebugLog("ProduceOutputData: Speaker configuration changed from %u to %u channels", 
+                             decoder->lastSystemChannels, systemChannels);
+                    swr_free(&decoder->swrContext);
+                }
+                
                 // Set up swresample if needed for channel conversion to system speakers
                 if (!decoder->swrContext && channels != systemChannels) {
                     decoder->swrContext = swr_alloc();
@@ -985,6 +994,9 @@ static OSStatus ProduceOutputData(void *self,
                     
                     DebugLog("ProduceOutputData: Initialized swresample for %d -> %u channels (will pad to %u)", 
                              channels, systemChannels, outputChannels);
+                    
+                    // Remember the system channel count
+                    decoder->lastSystemChannels = systemChannels;
                 }
                 
                 // Log format info
@@ -1325,6 +1337,7 @@ static OSStatus EAC3OpenProc(void *self, AudioComponentInstance inInstance) {
     decoder->outputFormat.mSampleRate = 48000;
     decoder->packetFrameSize = 1536;
     decoder->maxPacketSize = 4096;
+    decoder->lastSystemChannels = 0;  // Will be set when swresample is initialized
     
     DebugLog("Initialized decoder at %p - input channels=%u, output channels=%u", 
              decoder, decoder->inputFormat.mChannelsPerFrame, decoder->outputFormat.mChannelsPerFrame);
