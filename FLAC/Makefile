@@ -3,7 +3,7 @@ CFLAGS = -arch x86_64 -mmacosx-version-min=10.6 -O2 -fPIC -IFLACAudioComponent/i
 LDFLAGS = -framework Carbon -framework AudioToolbox -framework CoreFoundation -framework CoreAudio -framework AudioUnit -LFLACAudioComponent/lib -lFLAC -dynamiclib -exported_symbols_list exports.txt
 
 COMPONENT_NAME = FLACAudioComponent
-BUNDLE_NAME = $(COMPONENT_NAME).component
+BUNDLE_NAME = FLAC.component
 SOURCE_DIR = FLACAudioComponent/Source
 RESOURCE_DIR = FLACAudioComponent/Resources
 BUILD_DIR = build
