@@ -2,7 +2,9 @@
 #include <AudioUnit/AudioCodec.h>
 #include <AudioUnit/AudioComponent.h>
 #include <AudioToolbox/AudioToolbox.h>
+#include <CoreAudio/CoreAudio.h>
 #include <opus.h>
+#include <opus_multistream.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -44,6 +46,7 @@ typedef struct OPUSDecoder {
     AudioStreamBasicDescription outputFormat;
     
     OpusDecoder *decoder;
+    OpusMSDecoder *msDecoder;  // For multi-stream/surround content
     
     UInt8 *inputBuffer;
     UInt32 inputBufferSize;
@@ -53,6 +56,9 @@ typedef struct OPUSDecoder {
     UInt32 outputBufferFrames;
     UInt32 outputBufferUsed;
     
+    Float32 *downmixBuffer;     // Buffer for downmixed audio
+    UInt32 downmixBufferFrames;
+    
     Boolean isInitialized;
     UInt32 packetFrameSize;
     UInt32 maxPacketSize;
@@ -61,6 +67,10 @@ typedef struct OPUSDecoder {
     int channels;
     int preskip;
     float gain;
+    
+    // Downmixing support
+    UInt32 lastSystemChannels;  // To detect speaker configuration changes
+    Boolean needsDownmix;       // Whether downmixing is required
 } OPUSDecoder;
 
 // AudioComponent plugin instance structure
@@ -95,6 +105,97 @@ static OSStatus Uninitialize(void *self);
 static OSStatus AppendInputData(void *self, const void *inInputData, UInt32 *ioInputDataByteSize, UInt32 *ioNumberPackets, const AudioStreamPacketDescription *inPacketDescription);
 static OSStatus ProduceOutputData(void *self, void *outOutputData, UInt32 *ioOutputDataByteSize, UInt32 *ioNumberPackets, AudioStreamPacketDescription *outPacketDescription, UInt32 *outStatus);
 static OSStatus Reset(void *self);
+
+// Helper function to get the system's default output device channel layout
+static AudioChannelLayout* GetSystemOutputChannelLayout(UInt32 *outChannelCount) {
+    AudioDeviceID deviceID;
+    UInt32 propertySize = sizeof(deviceID);
+    
+    // Get the default output device
+    AudioObjectPropertyAddress propertyAddress = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMaster
+    };
+    
+    OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress,
+                                                0, NULL, &propertySize, &deviceID);
+    if (status != noErr || deviceID == kAudioDeviceUnknown) {
+        DebugLog("GetSystemOutputChannelLayout: Failed to get default output device");
+        if (outChannelCount) *outChannelCount = 2;
+        return NULL;
+    }
+    
+    // Try to get preferred channel layout
+    propertyAddress.mSelector = kAudioDevicePropertyPreferredChannelLayout;
+    propertyAddress.mScope = kAudioDevicePropertyScopeOutput;
+    
+    status = AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, NULL, &propertySize);
+    if (status == noErr && propertySize > 0) {
+        AudioChannelLayout *layout = (AudioChannelLayout *)malloc(propertySize);
+        if (layout) {
+            status = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, NULL, &propertySize, layout);
+            if (status == noErr) {
+                DebugLog("GetSystemOutputChannelLayout: Got preferred channel layout");
+                
+                // Get channel count from layout
+                if (outChannelCount) {
+                    if (layout->mChannelLayoutTag != kAudioChannelLayoutTag_UseChannelDescriptions) {
+                        // Get channel count from layout tag
+                        UInt32 channelCount = 0;
+                        UInt32 propSize = sizeof(channelCount);
+                        AudioFormatGetProperty(kAudioFormatProperty_NumberOfChannelsForLayout,
+                                             sizeof(AudioChannelLayoutTag), &layout->mChannelLayoutTag,
+                                             &propSize, &channelCount);
+                        *outChannelCount = channelCount;
+                    } else {
+                        *outChannelCount = layout->mNumberChannelDescriptions;
+                    }
+                }
+                return layout;
+            }
+            free(layout);
+        }
+    }
+    
+    DebugLog("GetSystemOutputChannelLayout: No preferred channel layout, falling back to stream config");
+    
+    // Fall back to getting channel count from stream configuration
+    propertyAddress.mSelector = kAudioDevicePropertyStreamConfiguration;
+    propertyAddress.mScope = kAudioDevicePropertyScopeOutput;
+    
+    status = AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, NULL, &propertySize);
+    if (status != noErr) {
+        DebugLog("GetSystemOutputChannelLayout: Failed to get stream config size");
+        if (outChannelCount) *outChannelCount = 2;
+        return NULL;
+    }
+    
+    AudioBufferList *bufferList = (AudioBufferList *)malloc(propertySize);
+    if (!bufferList) {
+        if (outChannelCount) *outChannelCount = 2;
+        return NULL;
+    }
+    
+    status = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, NULL, &propertySize, bufferList);
+    if (status != noErr) {
+        free(bufferList);
+        DebugLog("GetSystemOutputChannelLayout: Failed to get stream config");
+        if (outChannelCount) *outChannelCount = 2;
+        return NULL;
+    }
+    
+    // Count total channels
+    UInt32 channelCount = 0;
+    for (UInt32 i = 0; i < bufferList->mNumberBuffers; i++) {
+        channelCount += bufferList->mBuffers[i].mNumberChannels;
+    }
+    
+    free(bufferList);
+    DebugLog("GetSystemOutputChannelLayout: System has %u output channels", channelCount);
+    if (outChannelCount) *outChannelCount = channelCount;
+    return NULL;
+}
 
 // AudioCodec implementation
 static OSStatus GetPropertyInfo(void *self,
@@ -524,7 +625,7 @@ static OSStatus Initialize(void *self,
         }
     }
     
-    // Determine channel count
+    // Determine channel count from input
     decoder->channels = decoder->inputFormat.mChannelsPerFrame;
     if (decoder->channels == 0) {
         decoder->channels = 2; // Default to stereo
@@ -540,26 +641,54 @@ static OSStatus Initialize(void *self,
         return kAudioCodecUnspecifiedError;
     }
     
+    // Get system output channel configuration
+    UInt32 systemChannels = 0;
+    AudioChannelLayout *systemLayout = GetSystemOutputChannelLayout(&systemChannels);
+    if (systemLayout) {
+        free(systemLayout);
+    }
+    
+    // Determine if we need downmixing
+    decoder->needsDownmix = (decoder->channels > systemChannels) && (systemChannels > 0);
+    if (decoder->needsDownmix) {
+        DebugLog("Initialize: Will downmix from %d to %u channels", decoder->channels, systemChannels);
+    }
+    
     // Initialize buffers
     decoder->inputBufferSize = 65536;
     decoder->inputBuffer = (UInt8 *)calloc(decoder->inputBufferSize, 1);
     decoder->inputBufferUsed = 0;
     
+    // Allocate output buffer for the actual output channel count
+    UInt32 outputChannels = decoder->needsDownmix ? systemChannels : decoder->channels;
     decoder->outputBufferFrames = 48000; // 1 second at 48kHz
-    decoder->outputBuffer = (Float32 *)calloc(decoder->outputBufferFrames * decoder->channels, sizeof(Float32));
+    decoder->outputBuffer = (Float32 *)calloc(decoder->outputBufferFrames * outputChannels, sizeof(Float32));
     decoder->outputBufferUsed = 0;
+    
+    // Allocate downmix buffer if needed (for intermediate decoded audio)
+    if (decoder->needsDownmix) {
+        decoder->downmixBufferFrames = 5760; // Maximum Opus frame size (120ms at 48kHz)
+        decoder->downmixBuffer = (Float32 *)calloc(decoder->downmixBufferFrames * decoder->channels, sizeof(Float32));
+    } else {
+        decoder->downmixBuffer = NULL;
+        decoder->downmixBufferFrames = 0;
+    }
     
     decoder->maxPacketSize = 4000;
     decoder->packetFrameSize = 960; // 20ms at 48kHz
     decoder->preskip = 0;
     decoder->gain = 1.0f;
+    decoder->lastSystemChannels = systemChannels;
     
-    // Update output format
+    // Update output format based on actual output channels
     decoder->outputFormat.mSampleRate = 48000;
-    decoder->outputFormat.mChannelsPerFrame = decoder->channels;
-    decoder->outputFormat.mBytesPerFrame = decoder->channels * sizeof(Float32);
+    decoder->outputFormat.mChannelsPerFrame = outputChannels;
+    decoder->outputFormat.mBytesPerFrame = outputChannels * sizeof(Float32);
     decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame;
     decoder->outputFormat.mFramesPerPacket = 1;
+    
+    DebugLog("Initialize: Input channels=%d, Output channels=%u, Downmix=%s", 
+             decoder->channels, outputChannels, decoder->needsDownmix ? "YES" : "NO");
     
     decoder->isInitialized = true;
     
@@ -582,6 +711,11 @@ static OSStatus Uninitialize(void *self) {
         decoder->decoder = NULL;
     }
     
+    if (decoder->msDecoder) {
+        opus_multistream_decoder_destroy(decoder->msDecoder);
+        decoder->msDecoder = NULL;
+    }
+    
     if (decoder->inputBuffer) {
         free(decoder->inputBuffer);
         decoder->inputBuffer = NULL;
@@ -590,6 +724,11 @@ static OSStatus Uninitialize(void *self) {
     if (decoder->outputBuffer) {
         free(decoder->outputBuffer);
         decoder->outputBuffer = NULL;
+    }
+    
+    if (decoder->downmixBuffer) {
+        free(decoder->downmixBuffer);
+        decoder->downmixBuffer = NULL;
     }
     
     decoder->isInitialized = false;
@@ -689,16 +828,26 @@ static OSStatus ProduceOutputData(void *self,
     if (decoder->inputBufferUsed > 0) {
         // Ensure we have space for output
         UInt32 maxFrames = 5760; // Maximum Opus frame size (120ms at 48kHz)
+        UInt32 outputChannels = decoder->outputFormat.mChannelsPerFrame;
+        
         if (decoder->outputBufferUsed + maxFrames > decoder->outputBufferFrames) {
             decoder->outputBufferFrames = (decoder->outputBufferUsed + maxFrames) * 2;
             decoder->outputBuffer = realloc(decoder->outputBuffer,
-                                          decoder->outputBufferFrames * decoder->channels * sizeof(Float32));
+                                          decoder->outputBufferFrames * outputChannels * sizeof(Float32));
+        }
+        
+        // Decode to temporary buffer if downmixing, otherwise directly to output
+        Float32 *decodeTarget;
+        if (decoder->needsDownmix) {
+            decodeTarget = decoder->downmixBuffer;
+        } else {
+            decodeTarget = decoder->outputBuffer + (decoder->outputBufferUsed * outputChannels);
         }
         
         int frameSize = opus_decode_float(decoder->decoder, 
                                          decoder->inputBuffer, 
                                          decoder->inputBufferUsed,
-                                         decoder->outputBuffer + (decoder->outputBufferUsed * decoder->channels),
+                                         decodeTarget,
                                          maxFrames,
                                          0);
         
@@ -708,9 +857,143 @@ static OSStatus ProduceOutputData(void *self,
             // Clear the input buffer on error
             decoder->inputBufferUsed = 0;
         } else {
+            // Check if speaker configuration changed
+            UInt32 systemChannels = 0;
+            AudioChannelLayout *systemLayout = GetSystemOutputChannelLayout(&systemChannels);
+            if (systemLayout) {
+                free(systemLayout);
+            }
+            
+            if (systemChannels != decoder->lastSystemChannels && systemChannels > 0) {
+                DebugLog("ProduceOutputData: Speaker configuration changed from %u to %u channels", 
+                         decoder->lastSystemChannels, systemChannels);
+                decoder->lastSystemChannels = systemChannels;
+                decoder->needsDownmix = (decoder->channels > systemChannels);
+                
+                // Reallocate output buffer if needed
+                if (systemChannels != outputChannels) {
+                    outputChannels = systemChannels;
+                    decoder->outputFormat.mChannelsPerFrame = outputChannels;
+                    decoder->outputFormat.mBytesPerFrame = outputChannels * sizeof(Float32);
+                    decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame;
+                    
+                    // Reallocate output buffer for new channel count
+                    free(decoder->outputBuffer);
+                    decoder->outputBuffer = (Float32 *)calloc(decoder->outputBufferFrames * outputChannels, sizeof(Float32));
+                    decoder->outputBufferUsed = 0;
+                }
+            }
+            
+            // If we need to downmix, do it now
+            if (decoder->needsDownmix) {
+                // Simple downmixing algorithm
+                Float32 *outputPtr = decoder->outputBuffer + (decoder->outputBufferUsed * outputChannels);
+                
+                for (int i = 0; i < frameSize; i++) {
+                    Float32 *inputFrame = decodeTarget + (i * decoder->channels);
+                    Float32 *outputFrame = outputPtr + (i * outputChannels);
+                    
+                    if (decoder->channels == 6 && outputChannels == 2) {
+                        // 5.1 to stereo downmix
+                        // L' = L + 0.707*C + 0.707*Ls + 0.707*LFE
+                        // R' = R + 0.707*C + 0.707*Rs + 0.707*LFE
+                        Float32 L = inputFrame[0];
+                        Float32 R = inputFrame[1];
+                        Float32 C = inputFrame[2];
+                        Float32 LFE = inputFrame[3];
+                        Float32 Ls = inputFrame[4];
+                        Float32 Rs = inputFrame[5];
+                        
+                        outputFrame[0] = L + 0.707f * C + 0.707f * Ls + 0.707f * LFE;
+                        outputFrame[1] = R + 0.707f * C + 0.707f * Rs + 0.707f * LFE;
+                    } else if (decoder->channels == 8 && outputChannels == 2) {
+                        // 7.1 to stereo downmix
+                        // Opus 7.1 channel order: L R C LFE BL BR SL SR
+                        Float32 L = inputFrame[0];
+                        Float32 R = inputFrame[1];
+                        Float32 C = inputFrame[2];
+                        Float32 LFE = inputFrame[3];
+                        Float32 BL = inputFrame[4];  // Back Left
+                        Float32 BR = inputFrame[5];  // Back Right
+                        Float32 SL = inputFrame[6];  // Side Left
+                        Float32 SR = inputFrame[7];  // Side Right
+                        
+                        outputFrame[0] = L + 0.707f * C + 0.5f * SL + 0.5f * BL + 0.707f * LFE;
+                        outputFrame[1] = R + 0.707f * C + 0.5f * SR + 0.5f * BR + 0.707f * LFE;
+                    } else if (decoder->channels == 8 && outputChannels == 6) {
+                        // 7.1 to 5.1 downmix
+                        Float32 L = inputFrame[0];
+                        Float32 R = inputFrame[1];
+                        Float32 C = inputFrame[2];
+                        Float32 LFE = inputFrame[3];
+                        Float32 BL = inputFrame[4];
+                        Float32 BR = inputFrame[5];
+                        Float32 SL = inputFrame[6];
+                        Float32 SR = inputFrame[7];
+                        
+                        outputFrame[0] = L + 0.707f * SL;  // L + Side Left
+                        outputFrame[1] = R + 0.707f * SR;  // R + Side Right
+                        outputFrame[2] = C;
+                        outputFrame[3] = LFE;
+                        outputFrame[4] = BL;  // Back Left becomes Left Surround
+                        outputFrame[5] = BR;  // Back Right becomes Right Surround
+                    } else if (decoder->channels > 2 && outputChannels == 2) {
+                        // Generic multichannel to stereo
+                        // Mix center channel equally to L/R, mix surrounds to their respective sides
+                        Float32 L = inputFrame[0];
+                        Float32 R = inputFrame[1];
+                        
+                        if (decoder->channels >= 3) {
+                            // Add center channel
+                            Float32 C = inputFrame[2];
+                            L += 0.707f * C;
+                            R += 0.707f * C;
+                        }
+                        
+                        if (decoder->channels >= 4) {
+                            // Check if we have LFE (4th channel in 5.1/7.1)
+                            if (decoder->channels >= 6) {
+                                // Has LFE, add it
+                                L += 0.707f * inputFrame[3];
+                                R += 0.707f * inputFrame[3];
+                            }
+                        }
+                        
+                        if (decoder->channels >= 5) {
+                            // Add surround channels
+                            L += 0.707f * inputFrame[4]; // Left surround
+                            R += 0.707f * inputFrame[decoder->channels > 5 ? 5 : 4]; // Right surround
+                        }
+                        
+                        if (decoder->channels >= 7) {
+                            // Add side channels if present (7.1)
+                            L += 0.5f * inputFrame[6]; // Side left
+                            R += 0.5f * inputFrame[7]; // Side right
+                        }
+                        
+                        outputFrame[0] = L;
+                        outputFrame[1] = R;
+                    } else if (decoder->channels == 1 && outputChannels == 2) {
+                        // Mono to stereo
+                        outputFrame[0] = inputFrame[0];
+                        outputFrame[1] = inputFrame[0];
+                    } else {
+                        // For other configurations, just copy what we can
+                        UInt32 channelsToCopy = decoder->channels < outputChannels ? decoder->channels : outputChannels;
+                        for (UInt32 ch = 0; ch < channelsToCopy; ch++) {
+                            outputFrame[ch] = inputFrame[ch];
+                        }
+                        // Zero out any remaining channels
+                        for (UInt32 ch = channelsToCopy; ch < outputChannels; ch++) {
+                            outputFrame[ch] = 0.0f;
+                        }
+                    }
+                }
+            }
+            
             decoder->outputBufferUsed += frameSize;
             decoder->inputBufferUsed = 0; // Consumed all input
-            DebugLog("ProduceOutputData: decoded %d frames", frameSize);
+            DebugLog("ProduceOutputData: decoded %d frames, downmixed=%s", frameSize, decoder->needsDownmix ? "YES" : "NO");
         }
     }
     
@@ -729,9 +1012,10 @@ static OSStatus ProduceOutputData(void *self,
         // Move remaining frames to the beginning
         UInt32 remainingFrames = decoder->outputBufferUsed - framesToCopy;
         if (remainingFrames > 0) {
+            UInt32 outputChannels = decoder->outputFormat.mChannelsPerFrame;
             memmove(decoder->outputBuffer, 
-                   decoder->outputBuffer + (framesToCopy * decoder->channels),
-                   remainingFrames * decoder->channels * sizeof(Float32));
+                   decoder->outputBuffer + (framesToCopy * outputChannels),
+                   remainingFrames * outputChannels * sizeof(Float32));
         }
         decoder->outputBufferUsed = remainingFrames;
         
