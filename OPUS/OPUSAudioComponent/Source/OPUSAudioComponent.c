@@ -635,10 +635,91 @@ static OSStatus Initialize(void *self,
     
     // Create Opus decoder
     int error;
-    decoder->decoder = opus_decoder_create(48000, decoder->channels, &error);
-    if (error != OPUS_OK || !decoder->decoder) {
-        DebugLog("Initialize: Failed to create Opus decoder: %d", error);
-        return kAudioCodecUnspecifiedError;
+    if (decoder->channels <= 2) {
+        // Use simple decoder for mono/stereo
+        decoder->decoder = opus_decoder_create(48000, decoder->channels, &error);
+        if (error != OPUS_OK || !decoder->decoder) {
+            DebugLog("Initialize: Failed to create Opus decoder: %d", error);
+            return kAudioCodecUnspecifiedError;
+        }
+        decoder->msDecoder = NULL;
+    } else {
+        // Use multistream decoder for >2 channels
+        int streams, coupled_streams;
+        unsigned char mapping[8] = {0};
+        
+        // Determine stream configuration based on channel count
+        switch (decoder->channels) {
+            case 3: // 3.0
+                streams = 2;
+                coupled_streams = 1;
+                mapping[0] = 0; // L
+                mapping[1] = 1; // R
+                mapping[2] = 2; // C
+                break;
+            case 4: // 4.0 (quad)
+                streams = 2;
+                coupled_streams = 2;
+                mapping[0] = 0; // FL
+                mapping[1] = 1; // FR
+                mapping[2] = 2; // BL
+                mapping[3] = 3; // BR
+                break;
+            case 5: // 5.0
+                streams = 3;
+                coupled_streams = 2;
+                mapping[0] = 0; // FL
+                mapping[1] = 1; // FR
+                mapping[2] = 4; // C
+                mapping[3] = 2; // BL
+                mapping[4] = 3; // BR
+                break;
+            case 6: // 5.1
+                streams = 4;
+                coupled_streams = 2;
+                mapping[0] = 0; // FL
+                mapping[1] = 1; // FR
+                mapping[2] = 4; // C
+                mapping[3] = 5; // LFE
+                mapping[4] = 2; // BL
+                mapping[5] = 3; // BR
+                break;
+            case 7: // 6.1
+                streams = 4;
+                coupled_streams = 3;
+                mapping[0] = 0; // FL
+                mapping[1] = 1; // FR
+                mapping[2] = 4; // C
+                mapping[3] = 6; // LFE
+                mapping[4] = 2; // BL
+                mapping[5] = 3; // BR
+                mapping[6] = 5; // BC
+                break;
+            case 8: // 7.1
+                streams = 5;
+                coupled_streams = 3;
+                mapping[0] = 0; // FL
+                mapping[1] = 1; // FR
+                mapping[2] = 4; // C
+                mapping[3] = 7; // LFE
+                mapping[4] = 5; // BL
+                mapping[5] = 6; // BR
+                mapping[6] = 2; // SL
+                mapping[7] = 3; // SR
+                break;
+            default:
+                DebugLog("Initialize: Unsupported channel count: %d", decoder->channels);
+                return kAudioCodecUnspecifiedError;
+        }
+        
+        decoder->msDecoder = opus_multistream_decoder_create(48000, decoder->channels, 
+                                                             streams, coupled_streams, 
+                                                             mapping, &error);
+        if (error != OPUS_OK || !decoder->msDecoder) {
+            DebugLog("Initialize: Failed to create Opus multistream decoder: %d", error);
+            return kAudioCodecUnspecifiedError;
+        }
+        decoder->decoder = NULL;
     }
     
     // Get system output channel configuration
@@ -844,15 +925,31 @@ static OSStatus ProduceOutputData(void *self,
             decodeTarget = decoder->outputBuffer + (decoder->outputBufferUsed * outputChannels);
         }
         
-        int frameSize = opus_decode_float(decoder->decoder, 
+        int frameSize;
+        if (decoder->decoder) {
+            // Use simple decoder for mono/stereo
+            frameSize = opus_decode_float(decoder->decoder, 
                                          decoder->inputBuffer, 
                                          decoder->inputBufferUsed,
                                          decodeTarget,
                                          maxFrames,
                                          0);
+        } else if (decoder->msDecoder) {
+            // Use multistream decoder for >2 channels
+            frameSize = opus_multistream_decode_float(decoder->msDecoder, 
+                                                     decoder->inputBuffer, 
+                                                     decoder->inputBufferUsed,
+                                                     decodeTarget,
+                                                     maxFrames,
+                                                     0);
+        } else {
+            DebugLog("ProduceOutputData: No decoder available");
+            decoder->inputBufferUsed = 0;
+            return kAudioCodecUnspecifiedError;
+        }
         
         if (frameSize < 0) {
-            DebugLog("ProduceOutputData: opus_decode_float failed: %d (%s)", 
+            DebugLog("ProduceOutputData: opus decode failed: %d (%s)", 
                      frameSize, opus_strerror(frameSize));
             // Clear the input buffer on error
             decoder->inputBufferUsed = 0;
@@ -1062,6 +1159,9 @@ static OSStatus Reset(void *self) {
     // Reset Opus decoder
     if (decoder->decoder) {
         opus_decoder_ctl(decoder->decoder, OPUS_RESET_STATE);
+    }
+    if (decoder->msDecoder) {
+        opus_multistream_decoder_ctl(decoder->msDecoder, OPUS_RESET_STATE);
     }
     
     return noErr;
