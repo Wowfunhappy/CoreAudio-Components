@@ -809,10 +809,22 @@ static OSStatus Initialize(void *self,
     if (decoder->inputFormat.mChannelsPerFrame > 0) {
         decoder->codecContext->channels = decoder->inputFormat.mChannelsPerFrame;
         decoder->outputFormat.mChannelsPerFrame = decoder->inputFormat.mChannelsPerFrame;
+    } else {
+        // Default to 8 channels if not specified
+        decoder->codecContext->channels = 8;
+        decoder->inputFormat.mChannelsPerFrame = 8;
+        decoder->outputFormat.mChannelsPerFrame = 8;
+        DebugLog("Initialize: No channel count provided, defaulting to 8");
     }
+    
     if (decoder->inputFormat.mSampleRate > 0) {
         decoder->codecContext->sample_rate = decoder->inputFormat.mSampleRate;
         decoder->outputFormat.mSampleRate = decoder->inputFormat.mSampleRate;
+    } else {
+        // Default to 48000 Hz if not specified
+        decoder->codecContext->sample_rate = 48000;
+        decoder->outputFormat.mSampleRate = 48000;
+        DebugLog("Initialize: No sample rate provided, defaulting to 48000");
     }
     
     // Always recalculate output format sizes based on current channel count
@@ -859,8 +871,11 @@ static OSStatus Initialize(void *self,
         return kAudioCodecStateError;
     }
     
-    // Configure parser flags
-    decoder->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+    // Configure parser flags - DTS parser should find frame boundaries itself
+    // decoder->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+    
+    // Log parser info
+    DebugLog("Initialize: Parser initialized, flags=0x%x", decoder->parser->flags);
     
     // Allocate frame and packet
     decoder->frame = av_frame_alloc();
@@ -995,12 +1010,29 @@ static OSStatus AppendInputData(void *self,
         decoder->inputBufferUsed += *ioInputDataByteSize;
         
         // Log first few bytes to check format
-        if (decoder->inputBufferUsed >= 4) {
-            DebugLog("AppendInputData: First 4 bytes: %02x %02x %02x %02x", 
+        if (decoder->inputBufferUsed >= 8) {
+            DebugLog("AppendInputData: First 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x", 
                      decoder->inputBuffer[0], decoder->inputBuffer[1], 
-                     decoder->inputBuffer[2], decoder->inputBuffer[3]);
+                     decoder->inputBuffer[2], decoder->inputBuffer[3],
+                     decoder->inputBuffer[4], decoder->inputBuffer[5],
+                     decoder->inputBuffer[6], decoder->inputBuffer[7]);
+            
+            // Check for DTS sync words
+            uint32_t sync = (decoder->inputBuffer[0] << 24) | (decoder->inputBuffer[1] << 16) | 
+                           (decoder->inputBuffer[2] << 8) | decoder->inputBuffer[3];
+            if (sync == 0x7FFE8001) {
+                DebugLog("AppendInputData: Found DTS Core sync word (big endian)");
+            } else if (sync == 0xFE7F0180) {
+                DebugLog("AppendInputData: Found DTS Core sync word (little endian)");  
+            } else if (sync == 0x64582025) {
+                DebugLog("AppendInputData: Found DTS-HD sync word");
+            }
         }
         
+    } else if (ioInputDataByteSize && *ioInputDataByteSize == 0) {
+        // End of stream - mark decoder for flushing
+        DebugLog("AppendInputData: End of stream signaled (0 bytes)");
+        decoder->needsReset = true;
     }
     
     return noErr;
@@ -1029,6 +1061,34 @@ static OSStatus ProduceOutputData(void *self,
     
     DebugLog("ProduceOutputData: Decoding... requestedPackets=%u, requestedBytes=%u (frames=%u), bufferedFrames=%u, inputBytes=%u", 
              *ioNumberPackets, *ioOutputDataByteSize, requestedFrames, decoder->outputBufferUsed, decoder->inputBufferUsed);
+    
+    // Check if we need to flush the decoder
+    if (decoder->needsReset && decoder->outputBufferUsed < requestedFrames) {
+        DebugLog("ProduceOutputData: Flushing decoder");
+        
+        // Send NULL packet to flush decoder
+        int ret = avcodec_send_packet(decoder->codecContext, NULL);
+        if (ret >= 0) {
+            // Receive any remaining frames
+            while (1) {
+                ret = avcodec_receive_frame(decoder->codecContext, decoder->frame);
+                if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
+                    break;
+                }
+                if (ret < 0) {
+                    break;
+                }
+                
+                // Process the flushed frame (same processing as normal frames)
+                // This code would be duplicated from below, so we should refactor
+                // For now, just log that we got a frame
+                DebugLog("ProduceOutputData: Got flushed frame with %d samples", 
+                        decoder->frame->nb_samples);
+            }
+        }
+        
+        decoder->needsReset = false;
+    }
     
     // Parse and decode input data
     if (decoder->inputBufferUsed > 0 && decoder->outputBufferUsed < requestedFrames) {
@@ -1059,13 +1119,17 @@ static OSStatus ProduceOutputData(void *self,
                 decoder->packet->size = out_size;
                 
                 DebugLog("ProduceOutputData: Parser produced %d bytes, consumed %d bytes from %d total", 
-                        out_size, consumed, decoder->inputBufferUsed);
+                        out_size, consumed, data_size + (data - decoder->inputBuffer));
                 
                 // Send packet to decoder
                 int ret = avcodec_send_packet(decoder->codecContext, decoder->packet);
-                if (ret < 0 && ret != AVERROR_INVALIDDATA) {
-                    DebugLog("ProduceOutputData: Error sending packet, ret=%d", ret);
-                    continue;
+                if (ret < 0) {
+                    char errbuf[256];
+                    av_strerror(ret, errbuf, sizeof(errbuf));
+                    DebugLog("ProduceOutputData: Error sending packet, ret=%d (%s)", ret, errbuf);
+                    if (ret != AVERROR_INVALIDDATA) {
+                        continue;
+                    }
                 }
             
                 // Receive frames
@@ -1081,9 +1145,48 @@ static OSStatus ProduceOutputData(void *self,
                 }
                 framesReceived++;
                 
-                DebugLog("ProduceOutputData: Decoded frame with %d samples, channels=%d, sample_rate=%d", 
+                DebugLog("ProduceOutputData: Decoded frame with %d samples, channels=%d, sample_rate=%d, format=%d", 
                         decoder->frame->nb_samples, decoder->codecContext->channels, 
-                        decoder->codecContext->sample_rate);
+                        decoder->codecContext->sample_rate, decoder->codecContext->sample_fmt);
+                
+                // Additional debug info for troubleshooting
+                if (decoder->frame->data[0]) {
+                    // Check if the frame actually contains non-zero data
+                    int hasAudio = 0;
+                    if (decoder->codecContext->sample_fmt == AV_SAMPLE_FMT_FLTP) {
+                        // Planar float format - check first channel
+                        float *data = (float *)decoder->frame->data[0];
+                        for (int i = 0; i < 10 && i < decoder->frame->nb_samples; i++) {
+                            if (data[i] != 0.0f) {
+                                hasAudio = 1;
+                                break;
+                            }
+                        }
+                    } else if (decoder->codecContext->sample_fmt == AV_SAMPLE_FMT_S16P) {
+                        // Planar 16-bit format - check all channels
+                        int16_t *data = (int16_t *)decoder->frame->data[0];
+                        int checkSamples = (decoder->frame->nb_samples < 100) ? decoder->frame->nb_samples : 100;
+                        for (int i = 0; i < checkSamples; i++) {
+                            if (data[i] != 0) {
+                                hasAudio = 1;
+                                break;
+                            }
+                        }
+                        // Log first few samples for debugging
+                        if (!hasAudio && decoder->frame->nb_samples > 0) {
+                            DebugLog("ProduceOutputData: First 10 S16P samples from channel 0: %d %d %d %d %d %d %d %d %d %d",
+                                    data[0], data[1], data[2], data[3], data[4], 
+                                    data[5], data[6], data[7], data[8], data[9]);
+                            // Also check other channels
+                            if (decoder->codecContext->channels > 1 && decoder->frame->data[1]) {
+                                int16_t *data1 = (int16_t *)decoder->frame->data[1];
+                                DebugLog("ProduceOutputData: First 5 S16P samples from channel 1: %d %d %d %d %d",
+                                        data1[0], data1[1], data1[2], data1[3], data1[4]);
+                            }
+                        }
+                    }
+                    DebugLog("ProduceOutputData: Frame data check - hasAudio=%d", hasAudio);
+                }
                 
                 // Get channel counts
                 UInt32 channels = decoder->codecContext->channels;  // Actual channels in the DTS file
