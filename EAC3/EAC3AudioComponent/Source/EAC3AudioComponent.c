@@ -18,6 +18,8 @@
 // Define DEBUG_LOGGING to enable debug output
 //#define DEBUG_LOGGING 1
 
+#define MAX_CHANNEL_COUNT 8
+
 #ifdef DEBUG_LOGGING
 // Debug logging
 static FILE *gLogFile = NULL;
@@ -93,6 +95,7 @@ static const AudioChannelLayoutTag kChannelLayoutTags[8] = {
     kAudioChannelLayoutTag_MPEG_5_1_D,   // 6 channels: C L R Ls Rs LFE
     kAudioChannelLayoutTag_AAC_6_1,      // 7 channels: C L R Ls Rs Cs LFE
     kAudioChannelLayoutTag_MPEG_7_1_B    // 8 channels: C Lc Rc L R Ls Rs LFE
+    // Note: We actually support up to MAX_CHANNEL_COUNT channels
 };
 
 // AudioCodec implementation
@@ -168,13 +171,13 @@ static OSStatus GetPropertyInfo(void *self,
             return noErr;
             
         case kAudioCodecPropertyAvailableNumberChannels:
-            if (outSize) *outSize = sizeof(UInt32) * 8; // Support 1-8 channels
+            if (outSize) *outSize = sizeof(UInt32) * MAX_CHANNEL_COUNT; // Support 1-MAX_CHANNEL_COUNT channels
             if (outWritable) *outWritable = false;
             return noErr;
             
         case kAudioCodecPropertyAvailableInputChannelLayouts:
         case kAudioCodecPropertyAvailableOutputChannelLayouts:
-            if (outSize) *outSize = 8 * sizeof(AudioChannelLayoutTag);
+            if (outSize) *outSize = MAX_CHANNEL_COUNT * sizeof(AudioChannelLayoutTag);
             if (outWritable) *outWritable = false;
             return noErr;
             
@@ -201,10 +204,14 @@ static OSStatus GetProperty(void *self,
             
         case kAudioCodecPropertyCurrentOutputFormat:
             if (*ioPropertyDataSize == sizeof(AudioStreamBasicDescription)) {
-                DebugLog("GetProperty: CurrentOutputFormat - channels=%u, bytesPerFrame=%u, sampleRate=%.0f",
+                DebugLog("GetProperty: CurrentOutputFormat - channels=%u, bytesPerFrame=%u, sampleRate=%.0f, formatID=%c%c%c%c",
                          decoder->outputFormat.mChannelsPerFrame,
                          decoder->outputFormat.mBytesPerFrame,
-                         decoder->outputFormat.mSampleRate);
+                         decoder->outputFormat.mSampleRate,
+                         (char)(decoder->outputFormat.mFormatID >> 24), (char)(decoder->outputFormat.mFormatID >> 16),
+                         (char)(decoder->outputFormat.mFormatID >> 8), (char)decoder->outputFormat.mFormatID);
+                DebugLog("GetProperty: CurrentOutputFormat - inputChannels=%u, isInitialized=%d",
+                         decoder->inputFormat.mChannelsPerFrame, decoder->isInitialized);
                 *(AudioStreamBasicDescription *)outPropertyData = decoder->outputFormat;
             } else {
                 return kAudioCodecBadPropertySizeError;
@@ -307,7 +314,11 @@ static OSStatus GetProperty(void *self,
                 
                 // Use appropriate channel layout based on channel count
                 if (channels >= 1 && channels <= 8) {
+                    // We have predefined layouts for 1-8 channels
                     layout->mChannelLayoutTag = kChannelLayoutTags[channels - 1];
+                } else if (channels > 8 && channels <= MAX_CHANNEL_COUNT) {
+                    // For more than 8 channels, use generic descriptions
+                    layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
                 } else {
                     layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
                 }
@@ -389,11 +400,11 @@ static OSStatus GetProperty(void *self,
             if (*ioPropertyDataSize < sizeof(UInt32) * 8) {
                 return kAudioCodecBadPropertySizeError;
             }
-            // Report support for 1-8 channels
-            for (UInt32 i = 0; i < 8; i++) {
+            // Report support for 1-MAX_CHANNEL_COUNT channels
+            for (UInt32 i = 0; i < MAX_CHANNEL_COUNT; i++) {
                 ((UInt32 *)outPropertyData)[i] = i + 1;
             }
-            *ioPropertyDataSize = sizeof(UInt32) * 8;
+            *ioPropertyDataSize = sizeof(UInt32) * MAX_CHANNEL_COUNT;
             return noErr;
             
         case kAudioCodecPropertyPrimeMethod:
@@ -419,13 +430,13 @@ static OSStatus GetProperty(void *self,
             
         case kAudioCodecPropertyAvailableInputChannelLayouts:
         case kAudioCodecPropertyAvailableOutputChannelLayouts:
-            if (*ioPropertyDataSize >= 8 * sizeof(AudioChannelLayoutTag)) {
+            if (*ioPropertyDataSize >= MAX_CHANNEL_COUNT * sizeof(AudioChannelLayoutTag)) {
                 AudioChannelLayoutTag *tags = (AudioChannelLayoutTag *)outPropertyData;
                 
                 if (decoder->isInitialized) {
                     // When initialized, only report the current channel layout
                     UInt32 channels = decoder->outputFormat.mChannelsPerFrame;
-                    if (channels >= 1 && channels <= 8) {
+                    if (channels >= 1 && channels <= MAX_CHANNEL_COUNT) {
                         tags[0] = kChannelLayoutTags[channels - 1];
                         *ioPropertyDataSize = sizeof(AudioChannelLayoutTag);
                     } else {
@@ -433,10 +444,12 @@ static OSStatus GetProperty(void *self,
                     }
                 } else {
                     // When not initialized, report all supported layouts
-                    for (UInt32 i = 0; i < 8; i++) {
+                    // Note: We only have defined layouts for up to 8 channels
+                    UInt32 layoutCount = (MAX_CHANNEL_COUNT > 8) ? 8 : MAX_CHANNEL_COUNT;
+                    for (UInt32 i = 0; i < layoutCount; i++) {
                         tags[i] = kChannelLayoutTags[i];
                     }
-                    *ioPropertyDataSize = 8 * sizeof(AudioChannelLayoutTag);
+                    *ioPropertyDataSize = MAX_CHANNEL_COUNT * sizeof(AudioChannelLayoutTag);
                 }
             } else {
                 return kAudioCodecBadPropertySizeError;
@@ -476,8 +489,8 @@ static OSStatus SetProperty(void *self,
                     return kAudioCodecUnsupportedFormatError;
                 }
                 
-                // EAC3 supports 1-8 channels
-                if (format->mChannelsPerFrame > 0 && (format->mChannelsPerFrame < 1 || format->mChannelsPerFrame > 8)) {
+                // EAC3 supports 1-MAX_CHANNEL_COUNT channels
+                if (format->mChannelsPerFrame > 0 && (format->mChannelsPerFrame < 1 || format->mChannelsPerFrame > MAX_CHANNEL_COUNT)) {
                     DebugLog("SetProperty: Invalid channel count: %u", format->mChannelsPerFrame);
                     return kAudioCodecUnsupportedFormatError;
                 }
@@ -733,13 +746,8 @@ static OSStatus Initialize(void *self,
     EAC3Decoder *decoder = EAC3_DECODER;
     
     DebugLog("Initialize called! self=%p, decoder=%p", self, decoder);
-    DebugLog("Initialize: Input format - channels=%u, Output format - channels=%u",
-             decoder->inputFormat.mChannelsPerFrame, decoder->outputFormat.mChannelsPerFrame);
     
-    // Save our desired channel count before QuickTime overwrites it
-    UInt32 desiredChannels = decoder->inputFormat.mChannelsPerFrame;
-    UInt32 requestedOutputChannels = decoder->outputFormat.mChannelsPerFrame;  // Save current output channels
-    DebugLog("Initialize: Saving original desired channels = %u", desiredChannels);
+    UInt32 requestedOutputChannels = decoder->outputFormat.mChannelsPerFrame;
     
     if (decoder->isInitialized) {
         DebugLog("Initialize: Already initialized");
@@ -765,7 +773,7 @@ static OSStatus Initialize(void *self,
         }
         decoder->outputFormat = *inOutputFormat;
         requestedOutputChannels = inOutputFormat->mChannelsPerFrame;
-        DebugLog("Initialize: QuickTime requested %u output channels", inOutputFormat->mChannelsPerFrame);
+        DebugLog("Initialize: QuickTime requested %u output channels", requestedOutputChannels);
     }
     
     // Find EAC3 decoder
@@ -782,19 +790,11 @@ static OSStatus Initialize(void *self,
         return kAudioCodecStateError;
     }
     
-    // Set codec parameters if we know them
-    if (decoder->inputFormat.mChannelsPerFrame > 0) {
-        decoder->codecContext->channels = decoder->inputFormat.mChannelsPerFrame;
-        decoder->outputFormat.mChannelsPerFrame = decoder->inputFormat.mChannelsPerFrame;
-    }
+    // Set sample rate if known
     if (decoder->inputFormat.mSampleRate > 0) {
         decoder->codecContext->sample_rate = decoder->inputFormat.mSampleRate;
         decoder->outputFormat.mSampleRate = decoder->inputFormat.mSampleRate;
     }
-    
-    // Always recalculate output format sizes based on current channel count
-    decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
-    decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame * decoder->outputFormat.mFramesPerPacket;
     
     // Open codec
     if (avcodec_open2(decoder->codecContext, decoder->codec, NULL) < 0) {
@@ -806,26 +806,28 @@ static OSStatus Initialize(void *self,
     DebugLog("Initialize: After avcodec_open2 - channels=%d, sample_rate=%d", 
              decoder->codecContext->channels, decoder->codecContext->sample_rate);
     
-    // avcodec_open2 may reset the channel count to 2 for EAC3
-    // We need to preserve our configured channel count for INPUT
-    if (desiredChannels > 0) {
-        decoder->codecContext->channels = desiredChannels;
-        decoder->inputFormat.mChannelsPerFrame = desiredChannels;
-        
-        // Always force output to 8 channels. QuickTime locks the channel configuration during Initialize,
-        // before we know the actual channel count from the EAC3 bitstream.
-        
-        decoder->outputFormat.mChannelsPerFrame = 8;
-        DebugLog("Initialize: Forcing 8 output channels (input has %u)", desiredChannels);
-        
-        decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
-        decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame * decoder->outputFormat.mFramesPerPacket;
-        DebugLog("Initialize: Input channels=%u, Output channels=%u", 
-                 decoder->inputFormat.mChannelsPerFrame, decoder->outputFormat.mChannelsPerFrame);
+    // QuickTime seems to provide a channel count > 2 when (and only when) it knows the real count (e.g. from MKV)
+    if (requestedOutputChannels != 2 && requestedOutputChannels <= MAX_CHANNEL_COUNT) {
+        // QuickTime knows the correct channel count, trust it
+        decoder->outputFormat.mChannelsPerFrame = requestedOutputChannels;
+        decoder->inputFormat.mChannelsPerFrame = requestedOutputChannels;
+        decoder->codecContext->channels = requestedOutputChannels;
+        DebugLog("Initialize: Using QuickTime-requested channels: %u", requestedOutputChannels);
+    } else {
+        // As far as we can tell, QuickTime doesn't know the channel count. Unfortunately, neither do we;
+        // we'll get that later from the EAC3 bitstream. QuickTime locks the channel configuration during Initialize,
+        // so we'll tell it we have MAX_CHANNEL_COUNT channels. If we have less in reality, we'll add padding.
+        decoder->outputFormat.mChannelsPerFrame = MAX_CHANNEL_COUNT;
+        decoder->inputFormat.mChannelsPerFrame = MAX_CHANNEL_COUNT;
+        decoder->codecContext->channels = MAX_CHANNEL_COUNT;
+        DebugLog("Initialize: Using %u channel workaround (QuickTime provided %u)", MAX_CHANNEL_COUNT, requestedOutputChannels);
     }
     
-    DebugLog("Initialize: Output format after restoration - channels=%u, bytesPerFrame=%u",
-             decoder->outputFormat.mChannelsPerFrame, decoder->outputFormat.mBytesPerFrame);
+    decoder->outputFormat.mBytesPerFrame = decoder->outputFormat.mChannelsPerFrame * sizeof(Float32);
+    decoder->outputFormat.mBytesPerPacket = decoder->outputFormat.mBytesPerFrame * decoder->outputFormat.mFramesPerPacket;
+    DebugLog("Initialize: Final - Input channels=%u, Output channels=%u", 
+             decoder->inputFormat.mChannelsPerFrame, decoder->outputFormat.mChannelsPerFrame);
+    
     
     // Create parser
     decoder->parser = av_parser_init(decoder->codec->id);
@@ -869,7 +871,7 @@ static OSStatus Initialize(void *self,
     }
     
     decoder->outputBufferFrames = 16384;
-    decoder->outputBuffer = malloc(decoder->outputBufferFrames * 8 * sizeof(Float32));
+    decoder->outputBuffer = malloc(decoder->outputBufferFrames * MAX_CHANNEL_COUNT * sizeof(Float32));
     if (!decoder->outputBuffer) {
         DebugLog("Initialize: Failed to allocate output buffer");
         free(decoder->inputBuffer);
@@ -1060,12 +1062,14 @@ static OSStatus ProduceOutputData(void *self,
                 
                 // Get channel counts
                 UInt32 channels = decoder->codecContext->channels;  // Actual channels in the EAC3 file
-                UInt32 outputChannels = decoder->outputFormat.mChannelsPerFrame;  // Always 8
+                UInt32 outputChannels = decoder->outputFormat.mChannelsPerFrame;  // What we told QuickTime
                 UInt32 systemChannels = 0;  // Will be set to actual speaker configuration
+                
+                DebugLog("ProduceOutputData: channels=%u, outputChannels=%u (from format)", channels, outputChannels);
                 
                 // 1. 'channels' = what the EAC3 file actually contains
                 // 2. 'systemChannels' = what speakers the user has (e.g. 2 for stereo)
-                // 3. 'outputChannels' = what we tell QuickTime (always 8)
+                // 3. 'outputChannels' = what we tell QuickTime
                 // We downmix from 'channels' to 'systemChannels' for proper audio mixing,
                 // then pad from 'systemChannels' to 'outputChannels' with silence.
                 
@@ -1172,7 +1176,7 @@ static OSStatus ProduceOutputData(void *self,
                     decoder->outputBufferFrames = requiredFrames * 2;
                     // Always allocate for maximum possible channels to avoid issues
                     decoder->outputBuffer = realloc(decoder->outputBuffer,
-                                               decoder->outputBufferFrames * 8 * sizeof(Float32));
+                                               decoder->outputBufferFrames * MAX_CHANNEL_COUNT * sizeof(Float32));
                     if (!decoder->outputBuffer) {
                         return kAudioCodecStateError;
                     }
@@ -1202,12 +1206,16 @@ static OSStatus ProduceOutputData(void *self,
                         continue;
                     }
                     
-                    // During initialize, we told QuickTime we had 8 channels, because at the time we had no way to
-                    // know the real number. Now QuickTime expects us to provide 8 channels, and will play content at
-                    // the wrong speed if we do not. If we have less than 8 real channels (because either the content
-                    // or the user's output device has less), pad the difference with silent channels.
+                    // During initialize, QuickTime asked us how many channels we had, but it was too early for us to
+                    // know the answer. If QuickTime seemed to already know the correct channel count, we trusted it;
+                    // otherwise, we said we had MAX_CHANNEL_COUNT channels.
+
+                    // Now we know the true number of channels, but QuickTime won't let us change our previous answer.
+                    // We must provide the same number of channels we said we had, or QuickTime will play content at
+                    // the wrong speed. If we have fewer real channels (including after downmixing if applicable),
+                    // pad the difference with silent channels.
                     
-                    // Copy downmixed audio to output buffer with padding to reach 8 channels
+                    // Copy downmixed audio to output buffer with padding to reach outputChannels
                     for (UInt32 sample = 0; sample < samples; sample++) {
                         // Copy the actual audio channels from the downmixed output
                         for (UInt32 ch = 0; ch < systemChannels; ch++) {
@@ -1280,7 +1288,7 @@ static OSStatus ProduceOutputData(void *self,
                             continue;
                     }
                     
-                    // Copy to output buffer with padding to 8 channels
+                    // Copy to output buffer with padding to outputChannels
                     for (UInt32 sample = 0; sample < samples; sample++) {
                         // Copy actual audio channels from the source
                         for (UInt32 ch = 0; ch < channels && ch < outputChannels; ch++) {
@@ -1414,7 +1422,7 @@ static OSStatus Reset(void *self) {
         memset(decoder->inputBuffer, 0, decoder->inputBufferSize);
     }
     if (decoder->outputBuffer) {
-        memset(decoder->outputBuffer, 0, decoder->outputBufferFrames * 8 * sizeof(Float32));
+        memset(decoder->outputBuffer, 0, decoder->outputBufferFrames * MAX_CHANNEL_COUNT * sizeof(Float32));
     }
     
     // Flush decoder
@@ -1485,7 +1493,7 @@ static OSStatus EAC3OpenProc(void *self, AudioComponentInstance inInstance) {
     decoder->inputFormat.mBytesPerPacket = 0;
     decoder->inputFormat.mFramesPerPacket = 0;
     decoder->inputFormat.mBytesPerFrame = 0;
-    decoder->inputFormat.mChannelsPerFrame = 8;  // Default to 8 channels (7.1 surround)
+    decoder->inputFormat.mChannelsPerFrame = 2;
     decoder->inputFormat.mBitsPerChannel = 0;
     decoder->inputFormat.mSampleRate = 48000;
     
@@ -1493,9 +1501,9 @@ static OSStatus EAC3OpenProc(void *self, AudioComponentInstance inInstance) {
     decoder->outputFormat.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian;
     decoder->outputFormat.mBitsPerChannel = 32;
     decoder->outputFormat.mFramesPerPacket = 1;
-    decoder->outputFormat.mChannelsPerFrame = 8;  // Default to 8 channels for 7.1 support
-    decoder->outputFormat.mBytesPerFrame = 8 * sizeof(Float32);
-    decoder->outputFormat.mBytesPerPacket = 8 * sizeof(Float32);
+    decoder->outputFormat.mChannelsPerFrame = 2;
+    decoder->outputFormat.mBytesPerFrame = 2 * sizeof(Float32);
+    decoder->outputFormat.mBytesPerPacket = 2 * sizeof(Float32);
     decoder->outputFormat.mSampleRate = 48000;
     decoder->packetFrameSize = 1536;
     decoder->maxPacketSize = 4096;
