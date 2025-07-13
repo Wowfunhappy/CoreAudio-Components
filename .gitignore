@@ -1,7 +1,6 @@
 build/
 *.o
 *.dylib
-FLACAudioComponent.component/
 .DS_Store
 .DS_Store?
 ._*
@@ -14,5 +13,6 @@ _
 Reference/
 -
 .claude
-OPUS/Opus.component
-FLAC/FLAC.component
+OPUS/WFH Opus.component/
+FLAC/WFH FLAC.component/
+EAC3/WFH EAC3.component/
