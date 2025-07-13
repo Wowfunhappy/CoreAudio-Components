@@ -26,21 +26,21 @@ $(DYLIB): $(OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^
 
 $(BUNDLE_NAME): $(DYLIB)
-	mkdir -p $(BUNDLE_NAME)/Contents/MacOS
-	mkdir -p $(BUNDLE_NAME)/Contents/Resources
-	cp $(DYLIB) $(BUNDLE_NAME)/Contents/MacOS/
-	cp $(RESOURCE_DIR)/Info.plist $(BUNDLE_NAME)/Contents/
-	touch $(BUNDLE_NAME)
+	mkdir -p "$(BUNDLE_NAME)/Contents/MacOS"
+	mkdir -p "$(BUNDLE_NAME)/Contents/Resources"
+	cp $(DYLIB) "$(BUNDLE_NAME)/Contents/MacOS/"
+	cp $(RESOURCE_DIR)/Info.plist "$(BUNDLE_NAME)/Contents/"
+	touch "$(BUNDLE_NAME)"
 
 install: $(BUNDLE_NAME)
-	mkdir -p $(INSTALL_DIR)
-	rm -rf $(INSTALL_DIR)/$(BUNDLE_NAME)
-	cp -R $(BUNDLE_NAME) $(INSTALL_DIR)/
+	mkdir -p "$(INSTALL_DIR)"
+	rm -rf "$(INSTALL_DIR)/$(BUNDLE_NAME)"
+	cp -R "$(BUNDLE_NAME)" "$(INSTALL_DIR)/"
 
 clean:
-	rm -rf $(BUILD_DIR) $(BUNDLE_NAME)
+	rm -rf $(BUILD_DIR) "$(BUNDLE_NAME)"
 
 uninstall:
-	rm -rf $(INSTALL_DIR)/$(BUNDLE_NAME)
+	rm -rf "$(INSTALL_DIR)/$(BUNDLE_NAME)"
 
 .PHONY: all install clean uninstall
