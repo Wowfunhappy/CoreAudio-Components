@@ -14,7 +14,7 @@ LDFLAGS = -arch x86_64 -bundle -flat_namespace -undefined suppress \
           -L./EAC3AudioComponent/ffmpeg/lib \
           -lavcodec -lavutil -lswresample
 
-TARGET = build/EAC3.component
+TARGET = build/WFH EAC3.component
 
 SOURCES = EAC3AudioComponent/Source/EAC3AudioComponent.c
 
@@ -22,17 +22,17 @@ all: $(TARGET)
 
 $(TARGET): $(SOURCES)
 	@echo "Building EAC3 Audio Component..."
-	@mkdir -p build/EAC3.component/Contents/MacOS
-	@mkdir -p build/EAC3.component/Contents/Resources
-	$(CC) $(CFLAGS) $(LDFLAGS) -o build/EAC3.component/Contents/MacOS/EAC3AudioComponent $(SOURCES)
-	@cp EAC3AudioComponent/Resources/Info.plist build/EAC3.component/Contents/
+	@mkdir -p "build/WFH EAC3.component/Contents/MacOS"
+	@mkdir -p "build/WFH EAC3.component/Contents/Resources"
+	$(CC) $(CFLAGS) $(LDFLAGS) -o "build/WFH EAC3.component/Contents/MacOS/EAC3AudioComponent" $(SOURCES)
+	@cp EAC3AudioComponent/Resources/Info.plist "build/WFH EAC3.component/Contents/"
 	@echo "Build complete!"
 
 install: $(TARGET)
 	@echo "Installing EAC3 Audio Component..."
 	@mkdir -p ~/Library/Audio/Plug-Ins/Components
-	@rm -rf ~/Library/Audio/Plug-Ins/Components/EAC3.component
-	@cp -R build/EAC3.component ~/Library/Audio/Plug-Ins/Components/
+	@rm -rf "~/Library/Audio/Plug-Ins/Components/WFH EAC3.component"
+	@cp -R "build/WFH EAC3.component" ~/Library/Audio/Plug-Ins/Components/
 	@echo "Installation complete!"
 
 clean:

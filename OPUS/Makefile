@@ -3,7 +3,7 @@ CFLAGS = -arch x86_64 -mmacosx-version-min=10.6 -O2 -fPIC -IOPUSAudioComponent/i
 LDFLAGS = -framework Carbon -framework AudioToolbox -framework CoreFoundation -framework CoreAudio -framework AudioUnit -LOPUSAudioComponent/lib -lopus -dynamiclib -exported_symbols_list exports.txt
 
 COMPONENT_NAME = OPUSAudioComponent
-BUNDLE_NAME = Opus.component
+BUNDLE_NAME = WFH Opus.component
 SOURCE_DIR = OPUSAudioComponent/Source
 RESOURCE_DIR = OPUSAudioComponent/Resources
 BUILD_DIR = build
