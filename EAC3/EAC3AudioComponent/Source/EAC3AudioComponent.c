@@ -71,6 +71,8 @@ typedef struct EAC3Decoder {
     UInt32 packetFrameSize;
     UInt32 maxPacketSize;
     Boolean needsReset;
+    UInt32 cookieChannels;  // True channel count parsed from the dec3 magic cookie (0 = unknown).
+                            // Persists across Initialize/Uninitialize/Reset cycles for one instance.
 } EAC3Decoder;
 
 // AudioComponent plugin instance structure
@@ -97,6 +99,108 @@ static const AudioChannelLayoutTag kChannelLayoutTags[8] = {
     kAudioChannelLayoutTag_MPEG_7_1_B    // 8 channels: C Lc Rc L R Ls Rs LFE
     // Note: We actually support up to MAX_CHANNEL_COUNT channels
 };
+
+// --- E-AC-3 channel count from the 'dec3' magic cookie ----------------------------
+// QuickTime hands us the elementary-stream config as the magic cookie. For E-AC-3 in
+// MP4/MOV this carries a 'dec3' box (EC3SpecificBox, ETSI TS 102 366 Annex F) that
+// describes each independent substream. Parsing acmod + lfeon (+ chan_loc for any
+// dependent substreams) tells us the true channel count up front, which we otherwise
+// could not know until after decoding a frame.
+
+// Full-bandwidth channels implied by each acmod value (before adding LFE).
+static const int kAcmodChannels[8] = { 2, 1, 2, 3, 3, 4, 4, 5 };
+
+// Big-endian bit reader over a byte buffer. Reads past the end return zero bits.
+typedef struct {
+    const UInt8 *data;
+    UInt32 size;     // bytes available
+    UInt32 bitPos;   // current bit offset
+} EAC3BitReader;
+
+static UInt32 EAC3BitsRead(EAC3BitReader *br, UInt32 nbits) {
+    UInt32 value = 0;
+    for (UInt32 i = 0; i < nbits; i++) {
+        UInt32 byteIndex = br->bitPos >> 3;
+        UInt32 bit = 0;
+        if (byteIndex < br->size) {
+            bit = (br->data[byteIndex] >> (7 - (br->bitPos & 7))) & 1;
+        }
+        value = (value << 1) | bit;
+        br->bitPos++;
+    }
+    return value;
+}
+
+// Channels contributed by each chan_loc bit of a dependent substream
+// (pairs contribute 2, single speakers contribute 1).
+static int EAC3ChanLocChannels(UInt32 chanLoc) {
+    static const int perBit[9] = {
+        2, // bit 0: Lc/Rc
+        2, // bit 1: Lrs/Rrs
+        1, // bit 2: Cs
+        1, // bit 3: Ts
+        2, // bit 4: Lsd/Rsd
+        2, // bit 5: Lw/Rw
+        2, // bit 6: Lvh/Rvh
+        1, // bit 7: Cvh
+        1  // bit 8: LFE2
+    };
+    int extra = 0;
+    for (int b = 0; b < 9; b++) {
+        if (chanLoc & (1u << b)) extra += perBit[b];
+    }
+    return extra;
+}
+
+// Parse a raw EC3SpecificBox payload (bytes following the 'dec3' fourcc).
+// Returns the channel count of the main program, or 0 if it can't be determined.
+static UInt32 EAC3ParseDec3Payload(const UInt8 *payload, UInt32 len) {
+    if (!payload || len < 2) return 0;
+
+    EAC3BitReader br = { payload, len, 0 };
+    EAC3BitsRead(&br, 13);                          // data_rate
+    UInt32 numIndSub = EAC3BitsRead(&br, 3) + 1;    // num_ind_sub (stored as count - 1)
+
+    UInt32 mainProgramChannels = 0;
+    for (UInt32 s = 0; s < numIndSub; s++) {
+        EAC3BitsRead(&br, 2);                       // fscod
+        EAC3BitsRead(&br, 5);                       // bsid
+        EAC3BitsRead(&br, 1);                       // reserved
+        EAC3BitsRead(&br, 1);                       // asvc
+        EAC3BitsRead(&br, 3);                       // bsmod
+        UInt32 acmod = EAC3BitsRead(&br, 3);
+        UInt32 lfeon = EAC3BitsRead(&br, 1);
+        EAC3BitsRead(&br, 3);                       // reserved
+        UInt32 numDepSub = EAC3BitsRead(&br, 4);
+
+        UInt32 subChannels = (UInt32)kAcmodChannels[acmod & 7] + (lfeon ? 1u : 0u);
+        if (numDepSub > 0) {
+            UInt32 chanLoc = EAC3BitsRead(&br, 9);
+            subChannels += (UInt32)EAC3ChanLocChannels(chanLoc);
+        } else {
+            EAC3BitsRead(&br, 1);                   // reserved
+        }
+
+        // The decoder renders the first independent substream (the main program);
+        // any further independent substreams are alternate programs.
+        if (s == 0) mainProgramChannels = subChannels;
+    }
+    return mainProgramChannels;
+}
+
+// Scan a magic cookie for a 'dec3' box and return its channel count, or 0 if none.
+// The cookie may wrap the box (e.g. an 'frma'/'ec-3' box followed by 'dec3'), so we
+// search for the fourcc rather than assuming a fixed offset.
+static UInt32 EAC3ChannelCountFromCookie(const void *cookie, UInt32 cookieSize) {
+    if (!cookie || cookieSize < 5) return 0;
+    const UInt8 *bytes = (const UInt8 *)cookie;
+    for (UInt32 i = 0; i + 4 <= cookieSize; i++) {
+        if (bytes[i] == 'd' && bytes[i+1] == 'e' && bytes[i+2] == 'c' && bytes[i+3] == '3') {
+            return EAC3ParseDec3Payload(bytes + i + 4, cookieSize - (i + 4));
+        }
+    }
+    return 0;
+}
 
 // AudioCodec implementation
 static OSStatus GetPropertyInfo(void *self,
@@ -523,7 +627,20 @@ static OSStatus SetProperty(void *self,
                 return noErr;
             }
             return kAudioCodecBadPropertySizeError;
-            
+
+        case kAudioCodecPropertyMagicCookie:
+            // We don't need the cookie to decode, but it carries the dec3 box with the
+            // true channel count. Capture it here in case the host sets it before
+            // Initialize (so the very first Initialize already knows the real count).
+            {
+                UInt32 cookieChannels = EAC3ChannelCountFromCookie(inPropertyData, inPropertyDataSize);
+                if (cookieChannels > 0 && cookieChannels <= MAX_CHANNEL_COUNT) {
+                    decoder->cookieChannels = cookieChannels;
+                    DebugLog("SetProperty: Parsed %u channels from dec3 magic cookie", cookieChannels);
+                }
+            }
+            return noErr;
+
         default:
             return kAudioCodecUnknownPropertyError;
     }
@@ -746,7 +863,21 @@ static OSStatus Initialize(void *self,
     EAC3Decoder *decoder = EAC3_DECODER;
     
     DebugLog("Initialize called! self=%p, decoder=%p", self, decoder);
-    
+
+    // DIAGNOSTIC: log the magic cookie QuickTime passes us. For EAC3 in MP4/MOV this
+    // should be a 'dec3' (EC3SpecificBox) carrying the real channel configuration.
+    DebugLog("Initialize: magic cookie ptr=%p size=%u", inMagicCookie, (unsigned int)inMagicCookieByteSize);
+    if (inMagicCookie && inMagicCookieByteSize > 0) {
+        const unsigned char *cookieBytes = (const unsigned char *)inMagicCookie;
+        UInt32 dumpLen = inMagicCookieByteSize < 64 ? inMagicCookieByteSize : 64;
+        char hex[64 * 3 + 1];
+        UInt32 pos = 0;
+        for (UInt32 i = 0; i < dumpLen; i++) {
+            pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x ", cookieBytes[i]);
+        }
+        DebugLog("Initialize: magic cookie bytes: %s", hex);
+    }
+
     UInt32 requestedOutputChannels = decoder->outputFormat.mChannelsPerFrame;
     
     if (decoder->isInitialized) {
@@ -806,9 +937,25 @@ static OSStatus Initialize(void *self,
     DebugLog("Initialize: After avcodec_open2 - channels=%d, sample_rate=%d", 
              decoder->codecContext->channels, decoder->codecContext->sample_rate);
     
-    // QuickTime seems to provide a channel count > 2 when (and only when) it knows the real count (e.g. from MKV)
-    if (requestedOutputChannels != 2 && requestedOutputChannels <= MAX_CHANNEL_COUNT) {
-        // QuickTime knows the correct channel count, trust it
+    // The container's 'dec3' magic cookie tells us the true channel count. The host
+    // hands it to us inconsistently (the first Initialize of a converter's setup dance
+    // often has no cookie, a later one does), so remember it for this instance and let
+    // it win on every subsequent Initialize/Reset cycle.
+    UInt32 cookieChannels = EAC3ChannelCountFromCookie(inMagicCookie, inMagicCookieByteSize);
+    if (cookieChannels > 0 && cookieChannels <= MAX_CHANNEL_COUNT) {
+        decoder->cookieChannels = cookieChannels;
+        DebugLog("Initialize: Parsed %u channels from dec3 magic cookie", cookieChannels);
+    }
+
+    if (decoder->cookieChannels > 0 && decoder->cookieChannels <= MAX_CHANNEL_COUNT) {
+        // Authoritative: we know the real channel count from the container's dec3 box.
+        decoder->outputFormat.mChannelsPerFrame = decoder->cookieChannels;
+        decoder->inputFormat.mChannelsPerFrame = decoder->cookieChannels;
+        decoder->codecContext->channels = decoder->cookieChannels;
+        DebugLog("Initialize: Using dec3 cookie channels: %u", decoder->cookieChannels);
+    } else if (requestedOutputChannels != 2 && requestedOutputChannels <= MAX_CHANNEL_COUNT) {
+        // No cookie, but QuickTime seems to provide a channel count > 2 only when it
+        // actually knows the real count (e.g. from MKV), so trust it.
         decoder->outputFormat.mChannelsPerFrame = requestedOutputChannels;
         decoder->inputFormat.mChannelsPerFrame = requestedOutputChannels;
         decoder->codecContext->channels = requestedOutputChannels;
