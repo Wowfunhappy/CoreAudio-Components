@@ -12,7 +12,7 @@ SOURCES = $(SOURCE_DIR)/OPUSAudioComponent.c
 OBJECTS = $(BUILD_DIR)/OPUSAudioComponent.o
 DYLIB = $(BUILD_DIR)/$(COMPONENT_NAME)
 
-INSTALL_DIR = ~/Library/Audio/Plug-Ins/Components
+INSTALL_DIR = $(HOME)/Library/Audio/Plug-Ins/Components
 
 all: $(BUILD_DIR) $(BUNDLE_NAME)
 

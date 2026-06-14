@@ -6,7 +6,17 @@ These components were written almost entirely by Claude, via an enormous amount 
 
 Note that these components do NOT add support for additional containers. For example, the FLAC component will allow applications to play FLAC audio, but it will not teach them how to open .flac files. The FLAC audio stream would need to be in a container which the system already understands, such as .mov or .mp4. In the case of FLAC, this is quite unusual.
 
+
+
 MULTI-CHANNEL AUDIO:
-• FLAC: Supports multi-channel audio but without downmixing (excess channels discarded).
-• OPUS: Does not support multi-channel audio.
-• EAC3: Supports multi-channel audio up to a maximum of 8 channels with automatic downmixing when necessary. May misreport that audio has 8 channels regardless of actual count; this should not affect playback.
+===================
+
+FLAC & OPUS:
+-----------
+Supports multi-channel audio but without downmixing (excess channels discarded).
+
+EAC3:
+----
+Supports multi-channel audio with automatic downmixing when necessary. May misreport that audio has 8 channels regardless of actual count; this should not affect playback.
+
+If channel mappings are incorrect, please contact Wowfunhappy, who lacks the necessary audio setup to test this properly.
