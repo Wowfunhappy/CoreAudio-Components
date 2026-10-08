@@ -1,0 +1,16 @@
+Used FFmpeg 4.4.6.
+
+./configure --enable-static --disable-shared --disable-all --enable-avcodec --enable-avutil --enable-swresample --disable-programs --disable-doc --enable-parser=dca --enable-decoder=dca --disable-videotoolbox --disable-audiotoolbox --disable-iconv --x86asmexe=$HOME/Desktop/nasm --extra-cflags="-mmacosx-version-min=10.6" --extra-ldflags="-mmacosx-version-min=10.6" --prefix=$HOME/Desktop/ffmpeg-dts
+
+Notes:
+- The DTS (DTS Coherent Acoustics) decoder is called "dca" in FFmpeg; enable both the
+  "dca" parser and the "dca" decoder.
+- x86 SIMD assembly is built with NASM 3.01 at $HOME/Desktop/nasm (the system /usr/bin/nasm
+  is Apple's ancient 0.98 which FFmpeg rejects as too old). Pass it via --x86asmexe. If you
+  don't have a recent nasm, substitute --disable-x86asm for a slower but functional build.
+- --disable-videotoolbox is important: it strips libavutil's CoreVideo (CVPixelBuffer)
+  references. Without it the built .component fails to load, because CoreAudio's bundle
+  loader binds those undefined symbols and we don't link CoreVideo.
+- The helper script build-ffmpeg.sh automates the download/configure/build and copies the
+  resulting headers + static libs into DTSAudioComponent/ffmpeg/. Run "make ffmpeg".
+  Override the assembler with: NASM=/path/to/nasm ./build-ffmpeg.sh

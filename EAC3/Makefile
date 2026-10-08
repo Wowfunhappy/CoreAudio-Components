@@ -1,20 +1,21 @@
 # EAC3 Audio Component Makefile
 
 CC = gcc
-CFLAGS = -arch x86_64 -fPIC -O2 -Wall \
+CFLAGS = -arch x86_64 -mmacosx-version-min=10.9 -fPIC -O2 -Wall \
          -F/System/Library/Frameworks \
          -I./EAC3AudioComponent/ffmpeg/include \
          -DNDEBUG
 
-LDFLAGS = -arch x86_64 -bundle -flat_namespace -undefined suppress \
+LDFLAGS = -arch x86_64 -mmacosx-version-min=10.9 -bundle \
           -framework CoreFoundation \
           -framework CoreAudio \
           -framework AudioUnit \
           -framework AudioToolbox \
+          -framework CoreVideo \
           -L./EAC3AudioComponent/ffmpeg/lib \
-          -lavcodec -lavutil -lswresample
+          -lavcodec -lavutil -lswresample -liconv
 
-TARGET = build/WFH EAC3.component
+TARGET = build/WFH\ EAC3.component
 
 SOURCES = EAC3AudioComponent/Source/EAC3AudioComponent.c
 
@@ -24,7 +25,7 @@ $(TARGET): $(SOURCES)
 	@echo "Building EAC3 Audio Component..."
 	@mkdir -p "build/WFH EAC3.component/Contents/MacOS"
 	@mkdir -p "build/WFH EAC3.component/Contents/Resources"
-	$(CC) $(CFLAGS) $(LDFLAGS) -o "build/WFH EAC3.component/Contents/MacOS/EAC3AudioComponent" $(SOURCES)
+	$(CC) $(CFLAGS) -o "build/WFH EAC3.component/Contents/MacOS/EAC3AudioComponent" $(SOURCES) $(LDFLAGS)
 	@cp EAC3AudioComponent/Resources/Info.plist "build/WFH EAC3.component/Contents/"
 	@echo "Build complete!"
 
