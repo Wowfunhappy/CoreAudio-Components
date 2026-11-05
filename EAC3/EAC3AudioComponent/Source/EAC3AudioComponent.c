@@ -497,7 +497,9 @@ static OSStatus GetProperty(void *self,
             if (*ioPropertyDataSize != sizeof(UInt32)) {
                 return kAudioCodecBadPropertySizeError;
             }
-            *(UInt32 *)outPropertyData = 1; // EAC3 has variable packet sizes
+            // E-AC-3 packets vary in size, but the stream is self-framing and our FFmpeg
+            // parser deliberately does not depend on the host's packet descriptions.
+            *(UInt32 *)outPropertyData = 0;
             return noErr;
             
         case kAudioCodecPropertyAvailableNumberChannels:
@@ -1111,13 +1113,24 @@ static OSStatus AppendInputData(void *self,
     }
     
     if (inInputData && ioInputDataByteSize && *ioInputDataByteSize > 0) {
-        if (decoder->inputBufferUsed + *ioInputDataByteSize > decoder->inputBufferSize) {
-            decoder->inputBufferSize = (decoder->inputBufferUsed + *ioInputDataByteSize) * 2;
-            decoder->inputBuffer = realloc(decoder->inputBuffer, decoder->inputBufferSize);
+        UInt32 incomingBytes = *ioInputDataByteSize;
+        if (incomingBytes > UINT32_MAX - decoder->inputBufferUsed) {
+            return kAudioCodecNotEnoughBufferSpaceError;
+        }
+
+        UInt32 requiredBytes = decoder->inputBufferUsed + incomingBytes;
+        if (requiredBytes > decoder->inputBufferSize) {
+            UInt32 newSize = requiredBytes <= UINT32_MAX / 2 ? requiredBytes * 2 : requiredBytes;
+            UInt8 *newBuffer = realloc(decoder->inputBuffer, newSize);
+            if (!newBuffer) {
+                return kAudioCodecNotEnoughBufferSpaceError;
+            }
+            decoder->inputBuffer = newBuffer;
+            decoder->inputBufferSize = newSize;
         }
         
-        memcpy(decoder->inputBuffer + decoder->inputBufferUsed, inInputData, *ioInputDataByteSize);
-        decoder->inputBufferUsed += *ioInputDataByteSize;
+        memcpy(decoder->inputBuffer + decoder->inputBufferUsed, inInputData, incomingBytes);
+        decoder->inputBufferUsed += incomingBytes;
         
         // Log first few bytes to check format
         if (decoder->inputBufferUsed >= 4) {
@@ -1172,6 +1185,14 @@ static OSStatus ProduceOutputData(void *self,
             
             if (consumed < 0) {
                 DebugLog("ProduceOutputData: Parser error, consumed=%d", consumed);
+                break;
+            }
+
+            // A parser can legitimately need more data without consuming anything. After a
+            // seek this is especially common, because Reset recreates the parser. Preserve the
+            // remaining bytes for the next append instead of spinning forever on the audio
+            // conversion thread.
+            if (consumed == 0 && out_size == 0) {
                 break;
             }
             
@@ -1231,6 +1252,16 @@ static OSStatus ProduceOutputData(void *self,
                     DebugLog("ProduceOutputData: System reports %u channels but only %u are valid", 
                              systemChannels, actualSystemChannels);
                     systemChannels = actualSystemChannels;
+                }
+
+                // The negotiated output format owns the destination stride. A device can expose
+                // more channels than this stream (for example, 7.1 hardware playing a stereo or
+                // 5.1 file); using that larger device count below would write past every output
+                // frame. Core Audio handles any later upmix to the physical device.
+                if (systemChannels == 0) {
+                    systemChannels = outputChannels;
+                } else if (systemChannels > outputChannels) {
+                    systemChannels = outputChannels;
                 }
                 
                 // Check if speaker configuration changed
@@ -1319,14 +1350,21 @@ static OSStatus ProduceOutputData(void *self,
                 
                 // Ensure we have enough space
                 UInt32 requiredFrames = decoder->outputBufferUsed + samples;
+                if (requiredFrames < decoder->outputBufferUsed) {
+                    if (systemLayout) free(systemLayout);
+                    return kAudioCodecNotEnoughBufferSpaceError;
+                }
                 if (requiredFrames > decoder->outputBufferFrames) {
-                    decoder->outputBufferFrames = requiredFrames * 2;
+                    UInt32 newFrameCapacity = requiredFrames <= UINT32_MAX / 2 ? requiredFrames * 2 : requiredFrames;
                     // Always allocate for maximum possible channels to avoid issues
-                    decoder->outputBuffer = realloc(decoder->outputBuffer,
-                                               decoder->outputBufferFrames * MAX_CHANNEL_COUNT * sizeof(Float32));
-                    if (!decoder->outputBuffer) {
-                        return kAudioCodecStateError;
+                    Float32 *newBuffer = realloc(decoder->outputBuffer,
+                                               (size_t)newFrameCapacity * MAX_CHANNEL_COUNT * sizeof(Float32));
+                    if (!newBuffer) {
+                        if (systemLayout) free(systemLayout);
+                        return kAudioCodecNotEnoughBufferSpaceError;
                     }
+                    decoder->outputBuffer = newBuffer;
+                    decoder->outputBufferFrames = newFrameCapacity;
                 }
                 
                 // Use the actual channel count from the output format
@@ -1509,13 +1547,9 @@ static OSStatus ProduceOutputData(void *self,
         }
         decoder->outputBufferUsed = remainingFrames;
         
-        if (outPacketDescription) {
-            for (UInt32 i = 0; i < framesToCopy; i++) {
-                outPacketDescription[i].mStartOffset = i * decoder->outputFormat.mBytesPerFrame;
-                outPacketDescription[i].mVariableFramesInPacket = 0;
-                outPacketDescription[i].mDataByteSize = decoder->outputFormat.mBytesPerFrame;
-            }
-        }
+        // Decoder output is linear PCM. AudioCodec.h explicitly reserves output packet
+        // descriptions for non-PCM output, so do not write to this optional host buffer.
+        (void)outPacketDescription;
     } else {
         *ioOutputDataByteSize = 0;
     }
@@ -1577,14 +1611,27 @@ static OSStatus Reset(void *self) {
         avcodec_flush_buffers(decoder->codecContext);
     }
     
-    // Reset parser - recreate it to ensure clean state
+    // Reset parser - create the replacement before discarding the current parser, so an
+    // allocation failure cannot leave an initialized codec with a NULL parser.
     if (decoder->parser) {
-        av_parser_close(decoder->parser);
-        decoder->parser = av_parser_init(decoder->codec->id);
-        if (!decoder->parser) {
+        AVCodecParserContext *newParser = av_parser_init(decoder->codec->id);
+        if (newParser) {
+            // QuickTime appends complete compressed packets. Initialize sets this flag too;
+            // losing it only after a seek changes parser behavior and can strand the player.
+            newParser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+            av_parser_close(decoder->parser);
+            decoder->parser = newParser;
+        } else {
             DebugLog("Reset: Failed to recreate parser");
         }
     }
+
+    // Drop delayed resampler output as part of the discontinuity. The next decoded frame will
+    // rebuild the context for the current device layout.
+    if (decoder->swrContext) {
+        swr_free(&decoder->swrContext);
+    }
+    decoder->lastSystemChannels = 0;
     
     // Clear packet
     if (decoder->packet) {
